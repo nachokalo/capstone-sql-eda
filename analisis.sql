@@ -70,6 +70,40 @@ WHERE table_schema = 'public'
   AND character_maximum_length IS NOT NULL;
 
 
+-- Lo anterior informa; esto exige. Va acá arriba, antes de cualquier
+-- suma, porque un tipo equivocado o un cruce que multiplica filas
+-- ensucian todos los totales que vienen después: si el script llegara a
+-- imprimirlos y recién entonces cortara, el daño ya estaría hecho.
+DO $$
+DECLARE
+    base int := (SELECT count(*) FROM pedidos);
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'public'
+                 AND table_name IN ('clientes','productos','pedidos')
+                 AND ((column_name IN ('precio_lista','costo','precio_unitario')
+                       AND data_type <> 'numeric')
+                   OR (column_name IN ('fecha_pedido','fecha_alta')
+                       AND data_type <> 'date')
+                   OR character_maximum_length IS NOT NULL)) THEN
+        RAISE EXCEPTION 'Hay columnas con un tipo distinto del que el análisis supone';
+    END IF;
+
+    -- Los dos cruces que usa todo el análisis, controlados contra las
+    -- tablas porque la vista todavía no existe.
+    IF (SELECT count(*) FROM pedidos p
+        JOIN productos pr ON pr.producto_id = p.producto_id) <> base THEN
+        RAISE EXCEPTION 'El cruce de pedidos con productos multiplicó filas';
+    END IF;
+    IF (SELECT count(*) FROM pedidos p
+        JOIN clientes c ON c.cliente_id = p.cliente_id) <> base THEN
+        RAISE EXCEPTION 'El cruce de pedidos con clientes multiplicó filas';
+    END IF;
+
+    RAISE NOTICE 'Tipos de dato y cardinalidad de los cruces: verificados.';
+END $$;
+
+
 -- ---------------------------------------------------------------------
 -- 1.2. Cuánto hueco hay y dónde
 -- ---------------------------------------------------------------------
@@ -362,40 +396,10 @@ SELECT cruce,
 FROM controles
 ORDER BY cruce;
 
--- La tabla de arriba informa; este bloque exige. Si alguno de los cruces
--- multiplicara filas, el script corta acá en lugar de seguir y producir
--- un informe con todos los totales inflados, que es la forma en que este
--- error se cuela sin que nada falle.
-DO $$
-DECLARE
-    base int := (SELECT count(*) FROM pedidos);
-BEGIN
-    IF (SELECT count(*) FROM ventas_limpias) <> base THEN
-        RAISE EXCEPTION 'El cruce de pedidos con productos multiplicó filas';
-    END IF;
-    IF (SELECT count(*) FROM ventas_limpias v
-        JOIN clientes c ON c.cliente_id = v.cliente_id) <> base THEN
-        RAISE EXCEPTION 'El cruce de ventas con clientes multiplicó filas';
-    END IF;
-    IF (SELECT count(*) FROM ventas_limpias v
-        JOIN productos pr ON pr.producto_id = v.producto_id) <> base THEN
-        RAISE EXCEPTION 'El cruce de ventas con productos multiplicó filas';
-    END IF;
-
-    -- Los tipos que el análisis da por sentados.
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-               WHERE table_schema = 'public'
-                 AND table_name IN ('clientes','productos','pedidos')
-                 AND ((column_name IN ('precio_lista','costo','precio_unitario')
-                       AND data_type <> 'numeric')
-                   OR (column_name IN ('fecha_pedido','fecha_alta')
-                       AND data_type <> 'date')
-                   OR character_maximum_length IS NOT NULL)) THEN
-        RAISE EXCEPTION 'Hay columnas con un tipo distinto del que el análisis supone';
-    END IF;
-
-    RAISE NOTICE 'Cardinalidad de los tres cruces y tipos de dato: verificados.';
-END $$;
+-- La tabla de arriba informa; el bloque que las exige está más arriba,
+-- antes de la vista, porque de nada sirve enterarse de que un cruce
+-- multiplica filas después de haber impreso los totales calculados sobre
+-- esas filas de más.
 
 
 -- #####################################################################
@@ -537,8 +541,12 @@ ORDER BY DATE_TRUNC('month', fecha_pedido);
 -- silencio: se reportan como su propio período para que se vea cuánta
 -- facturación quedó fuera de la serie temporal.
 SELECT periodo,
-       count(*)     AS pedidos,
-       sum(importe) AS facturacion
+       count(*)        AS pedidos,
+       -- El denominador va declarado acá también: no todos esos pedidos
+       -- tienen importe conocido, así que la facturación de la tercera
+       -- columna no sale de los 157 de la segunda.
+       count(importe)  AS pedidos_con_importe,
+       sum(importe)    AS facturacion
 FROM ventas_limpias
 WHERE periodo = 'Sin fecha'
 GROUP BY periodo;
@@ -569,6 +577,7 @@ SELECT round(avg(abs(var)), 1)         AS variacion_media_abs,
        min(var)                        AS peor_variacion_pct,
        max(var)                        AS mejor_variacion_pct,
        round(avg(abs(var_dia)), 1)     AS variacion_media_abs_por_dia,
+       round(stddev(abs(var_dia)), 1)  AS desvio_por_dia,
        min(var_dia)                    AS peor_variacion_pct_por_dia,
        max(var_dia)                    AS mejor_variacion_pct_por_dia
 FROM variaciones WHERE var IS NOT NULL;
@@ -724,8 +733,12 @@ ORDER BY categoria, puesto, pedido_id;
 
 -- PUNTO 4, extensión B. El mismo ranking sobre los pedidos con precio
 -- original. Los que llevan precio completado toman el de lista sin
--- descuento, o sea el máximo posible de su producto, así que entran al
--- podio con un importe que nadie pagó. La comparación entre las dos
+-- descuento, o sea el máximo posible de su producto, así que le ganan a
+-- todos los pedidos reales del mismo artículo que sí llevaron descuento.
+-- Empatan con los pocos que se cobraron al precio de lista exacto, pero
+-- en la cabeza de las cinco categorías no hay ninguno de esos, de modo
+-- que el empate del primer puesto queda entre dos imputados. La
+-- comparación entre las dos
 -- salidas muestra cuánto pesa esa decisión, que es el motivo de dejarla
 -- a la vista en lugar de aplicarla en silencio sobre el ranking pedido.
 SELECT categoria, puesto, pedido_id, cliente_id, cantidad, importe, origen_del_precio
@@ -776,9 +789,12 @@ ranking AS (
                                                                 AS pct_de_su_categoria
     FROM facturacion_por_producto
 )
+-- Se muestran cuatro puestos y no tres: en Librería el artículo de alta
+-- rotación cae justo en el cuarto, y sin él la comparación entre
+-- categorías se lee al revés de lo que dice el dato.
 SELECT categoria, puesto, nombre, unidades, facturacion, pct_de_su_categoria
 FROM ranking
-WHERE puesto <= 3
+WHERE puesto <= 4
 ORDER BY categoria, puesto, nombre;
 
 -- PUNTO 4, extensión D. Cuántos productos entran al ranking anterior y
@@ -899,6 +915,7 @@ SELECT CASE cuartil WHEN 0 THEN 'Sin actividad'
        END AS clasificacion,
        count(*)                 AS clientes,
        sum(pedidos)             AS pedidos,
+       sum(pedidos_con_importe) AS pedidos_con_importe,
        sum(gasto)               AS facturacion,
        round(100.0 * sum(gasto) / NULLIF(SUM(sum(gasto)) OVER (), 0), 1) AS pct_facturacion,
        round(sum(gasto) / NULLIF(sum(pedidos_con_importe), 0), 2) AS importe_medio_por_pedido,
@@ -937,7 +954,7 @@ quiebre AS (
     SELECT puesto, gasto, gasto_siguiente
     FROM ordenados
     WHERE gasto_siguiente IS NOT NULL
-    ORDER BY gasto - gasto_siguiente DESC
+    ORDER BY gasto - gasto_siguiente DESC, puesto
     LIMIT 1
 )
 SELECT (SELECT puesto FROM quiebre)          AS clientes_arriba_del_quiebre,
@@ -1064,6 +1081,17 @@ WHERE fecha_pedido BETWEEN DATE '2025-01-01' AND DATE '2025-01-31';
 EXPLAIN (COSTS OFF)
 SELECT DATE_TRUNC('month', fecha_pedido), sum(importe) FROM ventas_limpias
 GROUP BY 1;
+
+-- Y los dos planes que justifican los índices de las claves foráneas,
+-- que no se usan en los cruces sino en las consultas de existencia del
+-- punto 3 y de la primera pregunta adicional.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM productos pr
+WHERE NOT EXISTS (SELECT 1 FROM pedidos p WHERE p.producto_id = pr.producto_id);
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM clientes c
+WHERE NOT EXISTS (SELECT 1 FROM pedidos p WHERE p.cliente_id = c.cliente_id);
 
 -- Cifras de cierre, para contrastar los totales contra los que cita el
 -- README.

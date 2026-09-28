@@ -145,10 +145,11 @@ FROM generate_series(1, 200) AS g;
 -- mirando las tablas. El precio base es cuadrático sobre el número de
 -- artículo y da varias vueltas sobre el módulo 9800, de modo que no
 -- crece de forma ordenada: interpolar entre los dos vecinos del catálogo
--- falla en cuatro de los seis casos, con errores de entre el cincuenta
--- por ciento y más de dos mil, y acierta en los otros dos por
--- casualidad. El segundo recaudo es el margen, que toma un valor propio
--- en cada artículo, así que el de al lado tampoco lo delata.
+-- se equivoca entre el cuarenta y nueve y el dos mil por ciento en
+-- cuatro de los seis casos, y en los otros dos queda a menos de dos
+-- puntos por casualidad. El segundo recaudo es el margen, que toma un
+-- valor propio en cada artículo, así que el de al lado tampoco lo
+-- delata.
 INSERT INTO productos (producto_id, nombre, categoria, precio_lista, costo, stock, activo)
 SELECT
     g,
@@ -254,8 +255,9 @@ UPDATE pedidos SET precio_unitario = NULL WHERE pedido_id % 11 = 5;
 UPDATE pedidos SET fecha_pedido = NULL WHERE pedido_id % 31 = 0;
 
 -- A esos se suman, por arrastre, los pedidos de los artículos sin precio
--- de lista. Ahí el costo no ofrece un atajo, porque cada artículo tiene
--- su propio margen y ninguna columna lo registra.
+-- de lista. El costo no permite despejar el precio, porque cada artículo
+-- tiene su propio margen y ninguna columna lo registra, pero sí permite
+-- acotarlo, y de eso se ocupa la etapa de limpieza.
 
 COMMIT;
 
@@ -312,6 +314,10 @@ FROM pedidos;
 
 -- Tres controles de integridad que sí pueden fallar, con el resultado
 -- escrito al lado para que no haya que deducirlo de la salida.
+--
+-- Corren después del COMMIT, así que un control fallado aborta el script
+-- pero deja la carga hecha: lo que garantizan es que nadie analice sobre
+-- datos inconsistentes, no que la base quede vacía.
 --
 -- La tabla de abajo los informa, y el bloque que sigue los exige: si uno
 -- fallara, el script corta con error en lugar de imprimir ALERTA y
@@ -380,7 +386,7 @@ BEGIN
         RAISE EXCEPTION 'la carga no cubre los 730 días del período';
     END IF;
 
-    RAISE NOTICE 'Controles de integridad: los seis pasaron.';
+    RAISE NOTICE 'Controles pasados: los tres de integridad y los tres de volumen.';
 END $$;
 
 -- Tipos declarados de las tres tablas, completos. Se listan todas las
