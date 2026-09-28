@@ -141,15 +141,19 @@ FROM generate_series(1, 200) AS g;
 -- artículo cuesta más de lo que se vende.
 --
 -- Dos recaudos para que los artículos sin precio cargado se parezcan a
--- un dato faltante de verdad, o sea para que no se puedan despejar
--- mirando las tablas. El precio base es cuadrático sobre el número de
--- artículo y da varias vueltas sobre el módulo 9800, de modo que no
--- crece de forma ordenada: interpolar entre los dos vecinos del catálogo
--- se equivoca entre el cuarenta y nueve y el dos mil por ciento en
--- cuatro de los seis casos, y en los otros dos queda a menos de dos
--- puntos por casualidad. El segundo recaudo es el margen, que toma un
--- valor propio en cada artículo, así que el de al lado tampoco lo
--- delata.
+-- un dato faltante, o sea para que no se despejen leyendo las tres
+-- tablas. El precio base es cuadrático sobre el número de artículo y da
+-- varias vueltas sobre el módulo 9800, de modo que no crece de forma
+-- ordenada: interpolar entre los dos vecinos del catálogo se equivoca
+-- entre el cuarenta y nueve y más de dos mil por ciento en cuatro de los
+-- seis casos, y en los otros dos queda a menos de dos puntos por
+-- casualidad. El segundo recaudo es el margen, que toma un valor propio
+-- en cada artículo, así que el de al lado tampoco lo delata.
+--
+-- Los dos recaudos valen frente a las tablas y no frente a este archivo:
+-- quien lea estas dos líneas tiene la fórmula y recupera cualquier
+-- precio. Es inevitable en un dataset generado y está declarado en el
+-- README.
 INSERT INTO productos (producto_id, nombre, categoria, precio_lista, costo, stock, activo)
 SELECT
     g,
@@ -157,10 +161,10 @@ SELECT
     (ARRAY['Electrónica','Hogar','Indumentaria','Deportes',
            'Librería'])[1 + (g % 5)],
     -- Seis artículos quedan sin precio de lista. El módulo 9 es coprimo
-    -- con el 5 de la categoría, de modo que el hueco se reparte: cinco
-    -- rubros con uno cada uno y Deportes con dos, que es el sobrante de
-    -- dividir seis entre cinco. La condición sobre los ocho primeros lo
-    -- mantiene lejos de los artículos de mayor rotación.
+    -- con el 5 de la categoría, de modo que el hueco se reparte: cuatro
+    -- rubros con uno cada uno y Deportes con dos. La condición sobre los
+    -- ocho primeros lo mantiene lejos de los artículos de mayor
+    -- rotación.
     CASE WHEN g % 9 = 4 AND g > 8 THEN NULL
          ELSE round((200 + ((g * g * 97 + g * 41) % 9800))::numeric, 2)
     END,
@@ -225,10 +229,11 @@ WHERE NOT (s.dia >= 366 AND s.g % 23 IN (4, 17));
 -- El precio unitario es el de lista menos un descuento de hasta el nueve
 -- coma seis por ciento, en pasos de una décima. El divisor 97 es primo y
 -- por lo tanto coprimo con todos los demás del generador, y da noventa y
--- seis descuentos distintos más el caso sin descuento: con pocos
--- escalones, cientos de pedidos terminarían con el importe exactamente
--- igual y cualquier ranking de pedidos devolvería empates masivos en
--- lugar de un orden.
+-- seis descuentos distintos más el caso sin descuento. Con pocos
+-- escalones habría muchos más pedidos con el importe exactamente igual;
+-- empates quedan igual, porque dos pedidos del mismo producto, la misma
+-- cantidad y el mismo escalón coinciden, pero son grupos chicos y no
+-- bloques que se lleven puestos enteros del ranking.
 --
 -- Que el precio cobrado y el de lista estén en el mismo orden de
 -- magnitud es lo que hace que más adelante completar un precio faltante
@@ -255,9 +260,10 @@ UPDATE pedidos SET precio_unitario = NULL WHERE pedido_id % 11 = 5;
 UPDATE pedidos SET fecha_pedido = NULL WHERE pedido_id % 31 = 0;
 
 -- A esos se suman, por arrastre, los pedidos de los artículos sin precio
--- de lista. El costo no permite despejar el precio, porque cada artículo
--- tiene su propio margen y ninguna columna lo registra, pero sí permite
--- acotarlo, y de eso se ocupa la etapa de limpieza.
+-- de lista. Desde las tablas el costo no permite despejar el precio,
+-- porque cada artículo tiene su propio margen y ninguna columna lo
+-- registra, pero sí permite acotarlo, y de eso se ocupa la etapa de
+-- limpieza.
 
 COMMIT;
 
@@ -315,9 +321,9 @@ FROM pedidos;
 -- Tres controles de integridad que sí pueden fallar, con el resultado
 -- escrito al lado para que no haya que deducirlo de la salida.
 --
--- Corren después del COMMIT, así que un control fallado aborta el script
--- pero deja la carga hecha: lo que garantizan es que nadie analice sobre
--- datos inconsistentes, no que la base quede vacía.
+-- Corren después del COMMIT, de manera que un control fallado aborta el
+-- script con la carga ya confirmada. Sirven para frenar el análisis, no
+-- para revertir la escritura.
 --
 -- La tabla de abajo los informa, y el bloque que sigue los exige: si uno
 -- fallara, el script corta con error en lugar de imprimir ALERTA y
@@ -385,8 +391,14 @@ BEGIN
     IF (SELECT count(DISTINCT fecha_pedido) FROM pedidos) <> 730 THEN
         RAISE EXCEPTION 'la carga no cubre los 730 días del período';
     END IF;
+    -- El conteo de pedidos es el denominador de casi todas las cifras
+    -- del informe, así que conviene que una corrida que no lo reproduzca
+    -- corte acá y no más adelante.
+    IF (SELECT count(*) FROM pedidos) <> 4889 THEN
+        RAISE EXCEPTION 'pedidos no cargó las 4889 filas esperadas';
+    END IF;
 
-    RAISE NOTICE 'Controles pasados: los tres de integridad y los tres de volumen.';
+    RAISE NOTICE 'Controles pasados: los tres de integridad y los cuatro de volumen.';
 END $$;
 
 -- Tipos declarados de las tres tablas, completos. Se listan todas las

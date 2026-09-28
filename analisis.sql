@@ -15,9 +15,9 @@
 --
 -- Cada punto arranca con la consulta tal como la pide el enunciado y,
 -- cuando hace falta, sigue con una extensión rotulada que agrega
--- columnas para poder decidir. Ese orden
--- es deliberado: la respuesta pedida se entrega sola, sin columnas de
--- más, y lo que agrego va al lado sin tocarla.
+-- columnas para poder decidir. Ese orden es deliberado: la respuesta
+-- pedida se entrega sola, sin columnas de más, y lo que agrego va al
+-- lado sin tocarla.
 --
 -- No modifica ninguna tabla, solo lee y crea una vista.
 --
@@ -43,7 +43,8 @@
 -- control no se queda en listar los tipos declarados, que son los que el
 -- script anterior escribió: marca ALERTA si alguno no es el que el
 -- análisis necesita.
-SELECT 'dinero en NUMERIC y no en punto flotante' AS control,
+SELECT 1 AS orden,
+       'dinero en NUMERIC y no en punto flotante' AS control,
        count(*) AS columnas_mal,
        CASE WHEN count(*) = 0 THEN 'OK' ELSE 'ALERTA' END AS resultado
 FROM information_schema.columns
@@ -52,7 +53,8 @@ WHERE table_schema = 'public'
   AND column_name IN ('precio_lista','costo','precio_unitario')
   AND data_type <> 'numeric'
 UNION ALL
-SELECT 'fechas en DATE y no en texto',
+SELECT 2,
+       'fechas en DATE y no en texto',
        count(*),
        CASE WHEN count(*) = 0 THEN 'OK' ELSE 'ALERTA' END
 FROM information_schema.columns
@@ -61,13 +63,16 @@ WHERE table_schema = 'public'
   AND column_name IN ('fecha_pedido','fecha_alta')
   AND data_type <> 'date'
 UNION ALL
-SELECT 'texto en TEXT y no en VARCHAR con límite',
+SELECT 3,
+       'texto en TEXT y no en VARCHAR con límite',
        count(*),
        CASE WHEN count(*) = 0 THEN 'OK' ELSE 'ALERTA' END
 FROM information_schema.columns
 WHERE table_schema = 'public'
   AND table_name IN ('clientes','productos','pedidos')
-  AND character_maximum_length IS NOT NULL;
+  AND character_maximum_length IS NOT NULL
+-- El orden de un UNION ALL no está garantizado, así que se declara.
+ORDER BY orden;
 
 
 -- Lo anterior informa; esto exige. Va acá arriba, antes de cualquier
@@ -89,8 +94,10 @@ BEGIN
         RAISE EXCEPTION 'Hay columnas con un tipo distinto del que el análisis supone';
     END IF;
 
-    -- Los dos cruces que usa todo el análisis, controlados contra las
-    -- tablas porque la vista todavía no existe.
+    -- Las dos claves por las que cruza todo el análisis, controladas
+    -- contra las tablas porque la vista todavía no existe. Alcanza con
+    -- dos porque el tercer cruce de la sección 1.4 vuelve a usar
+    -- productos.producto_id.
     IF (SELECT count(*) FROM pedidos p
         JOIN productos pr ON pr.producto_id = p.producto_id) <> base THEN
         RAISE EXCEPTION 'El cruce de pedidos con productos multiplicó filas';
@@ -222,7 +229,7 @@ SELECT origen_del_precio,
        sum(importe)   AS facturacion
 FROM ventas_limpias
 GROUP BY origen_del_precio
-ORDER BY sum(importe) DESC NULLS LAST;
+ORDER BY sum(importe) DESC NULLS LAST, origen_del_precio;
 
 -- El número que justifica haber hecho la limpieza: lo que se habría
 -- perdido dejando los nulos afuera de la suma en lugar de completarlos.
@@ -238,13 +245,44 @@ FROM pedidos;
 -- lista dejaría de ser una estimación y pasaría a ser un número
 -- inventado.
 SELECT count(*)                                              AS pedidos_medidos,
-       round(min(100.0 * (1 - p.precio_unitario / pr.precio_lista)), 1) AS descuento_min_pct,
-       round(max(100.0 * (1 - p.precio_unitario / pr.precio_lista)), 1) AS descuento_max_pct,
-       round(avg(100.0 * (1 - p.precio_unitario / pr.precio_lista)), 2) AS descuento_medio_pct
+       round(min(100.0 * (1 - p.precio_unitario / NULLIF(pr.precio_lista, 0))), 1) AS descuento_min_pct,
+       round(max(100.0 * (1 - p.precio_unitario / NULLIF(pr.precio_lista, 0))), 1) AS descuento_max_pct,
+       round(avg(100.0 * (1 - p.precio_unitario / NULLIF(pr.precio_lista, 0))), 2) AS descuento_medio_pct
 FROM pedidos p
 JOIN productos pr ON pr.producto_id = p.producto_id
 WHERE p.precio_unitario IS NOT NULL
   AND pr.precio_lista IS NOT NULL;
+
+-- Por qué el costo es mejor referencia que el promedio del rubro, con el
+-- caso más claro a la vista: el margen que le quedaría al artículo más
+-- barato si se lo valuara al precio unitario medio de su categoría,
+-- contra la banda de márgenes que muestra el catálogo entero.
+WITH banda AS (
+    SELECT min(costo / precio_lista) AS margen_min,
+           max(costo / precio_lista) AS margen_max
+    FROM productos WHERE precio_lista IS NOT NULL
+),
+medio_categoria AS (
+    SELECT pr.categoria, avg(p.precio_unitario) AS precio_medio
+    FROM pedidos p
+    JOIN productos pr ON pr.producto_id = p.producto_id
+    WHERE p.precio_unitario IS NOT NULL
+    GROUP BY pr.categoria
+)
+SELECT pr.producto_id,
+       pr.nombre,
+       pr.categoria,
+       pr.costo,
+       round(m.precio_medio, 2)                                AS precio_medio_del_rubro,
+       round((pr.costo / m.precio_medio)::numeric, 4)          AS margen_que_le_quedaria,
+       round(b.margen_min::numeric, 4)                         AS margen_minimo_del_catalogo,
+       round(b.margen_max::numeric, 4)                         AS margen_maximo_del_catalogo
+FROM productos pr
+JOIN medio_categoria m ON m.categoria = pr.categoria
+CROSS JOIN banda b
+WHERE pr.precio_lista IS NULL
+ORDER BY pr.costo, pr.producto_id
+LIMIT 1;
 
 -- Cuánto de esa diferencia es sesgo de la imputación. Se compara el
 -- precio de lista contra el precio que efectivamente se cobró en los
@@ -280,25 +318,31 @@ WHERE v.origen_del_precio = 'Completado con precio de lista';
 -- acá mismo, no se escribe a mano, para que la corrección siga siendo
 -- válida si cambian los datos.
 --
--- Es el promedio por pedido y no el ponderado por importe. Ponderar
--- mueve la corrección menos de mil pesos sobre ciento sesenta mil, o sea
--- que no cambia ninguna conclusión, pero conviene aclarar cuál de los
--- dos se usó.
+-- El descuento se puede promediar de dos formas y no dan lo mismo, así
+-- que van las dos en lugar de elegir una y afirmar que la otra no
+-- cambia nada: el promedio simple, que trata igual a todos los pedidos,
+-- y el ponderado por importe, que le da más peso a los pedidos grandes.
+-- La diferencia entre las dos correcciones es la última columna.
 WITH descuento AS (
-    SELECT avg(1 - p.precio_unitario / pr.precio_lista) AS factor
+    SELECT avg(1 - p.precio_unitario / pr.precio_lista) AS simple,
+           sum(p.cantidad * pr.precio_lista - p.cantidad * p.precio_unitario)
+               / sum(p.cantidad * pr.precio_lista) AS ponderado
     FROM pedidos p
     JOIN productos pr ON pr.producto_id = p.producto_id
     WHERE p.precio_unitario IS NOT NULL
       AND pr.precio_lista IS NOT NULL
 )
 SELECT round((SELECT sum(importe) FROM ventas_limpias), 2) AS total_como_se_informa,
+       round(sum(v.cantidad * pr.precio_lista * d.simple), 2)    AS correccion_simple,
+       round(sum(v.cantidad * pr.precio_lista * d.ponderado), 2) AS correccion_ponderada,
        round((SELECT sum(importe) FROM ventas_limpias)
-             - sum(v.cantidad * pr.precio_lista * (SELECT factor FROM descuento)), 2)
+             - sum(v.cantidad * pr.precio_lista * d.simple), 2)
                                                            AS total_con_descuento_aplicado,
-       round(sum(v.cantidad * pr.precio_lista * (SELECT factor FROM descuento)), 2)
-                                                           AS correccion
+       round(sum(v.cantidad * pr.precio_lista * (d.simple - d.ponderado)), 2)
+                                                           AS diferencia_entre_las_dos
 FROM ventas_limpias v
 JOIN productos pr ON pr.producto_id = v.producto_id
+CROSS JOIN descuento d
 WHERE v.origen_del_precio = 'Completado con precio de lista';
 
 -- Y del otro lado, cuánto le falta al total por los pedidos que no
@@ -367,11 +411,13 @@ WHERE v.origen_del_precio = 'Sin precio disponible';
 -- los totales quedarían inflados sin que nada falle. El conteo antes y
 -- después tiene que dar igual.
 --
--- Se controlan los tres cruces y no solo el primero, porque cada uno usa
--- una clave distinta. Hoy las tres son claves primarias declaradas y el
--- control no puede dar ALERTA; queda igual como red para el día en que
--- alguno de los cruces pase a usar una columna sin unicidad garantizada,
--- que es cuando el error aparece sin que nada falle.
+-- Se controlan los tres cruces que usa el análisis, que van por dos
+-- claves: clientes.cliente_id, y productos.producto_id, que entra dos
+-- veces porque lo pide la vista y después el ranking. Hoy las dos son
+-- claves primarias declaradas y el control no puede dar ALERTA; queda
+-- como red para el día en que alguno de los cruces pase a usar una
+-- columna sin unicidad garantizada, que es cuando el error aparece sin
+-- que nada falle.
 WITH controles AS (
     SELECT 'pedidos con productos'          AS cruce,
            (SELECT count(*) FROM pedidos)   AS antes,
@@ -467,7 +513,8 @@ LIMIT 5;
 -- sin importe conocido, el orden de la frontera sería una casualidad de
 -- la limpieza antes que un dato.
 SELECT cliente_id, nombre, gasto_total, pedidos_sin_importe,
-       gasto_total - LEAD(gasto_total) OVER (ORDER BY gasto_total DESC) AS ventaja_sobre_el_siguiente
+       gasto_total - LEAD(gasto_total) OVER (ORDER BY gasto_total DESC, cliente_id)
+                                                       AS ventaja_sobre_el_siguiente
 FROM (
     SELECT c.cliente_id,
            c.nombre,
@@ -479,7 +526,7 @@ FROM (
     ORDER BY gasto_total DESC NULLS LAST, c.cliente_id
     LIMIT 7
 ) AS frontera
-ORDER BY gasto_total DESC;
+ORDER BY gasto_total DESC, cliente_id;
 
 
 -- ---------------------------------------------------------------------
@@ -498,9 +545,8 @@ ORDER BY DATE_TRUNC('month', fecha_pedido);
 
 -- PUNTO 2, extensión A. La misma serie con la variación contra el mes
 -- anterior, sin la cual no hay forma de juzgar si un mes se salió de lo
--- normal.
--- La ventana la calcula en la misma pasada, así cada mes conserva su fila
--- sin necesidad de duplicar la tabla con una autounión.
+-- normal. La ventana la calcula en la misma pasada, así cada mes
+-- conserva su fila sin necesidad de duplicar la tabla con una autounión.
 --
 -- LAG toma el mes anterior de la serie y no el mes calendario anterior.
 -- Acá los veinticuatro meses están todos, así que coinciden; si algún mes
@@ -555,6 +601,7 @@ GROUP BY periodo;
 -- medida no hay forma de distinguir una señal de una oscilación normal,
 -- y es lo que justifica sacar la conclusión del agregado anual en lugar
 -- de un mes suelto.
+--
 -- Se mide sobre las dos series, la nominal y la normalizada por día con
 -- actividad, porque son cosas distintas: buena parte de la oscilación
 -- nominal es la cantidad de días del mes, y separar las dos es lo que
@@ -690,6 +737,7 @@ WHERE NOT EXISTS (SELECT 1 FROM pedidos p
 -- ordenar por un valor desconocido no significa nada. El NULLS LAST de la
 -- ventana los mandaría al final; el WHERE los saca del todo, que es lo
 -- que corresponde.
+--
 -- El ranking va completo, sin recortar. El enunciado pide el ranking y
 -- no un podio, así que la respuesta son las 4.571 filas con importe
 -- conocido, cada una con el puesto que le toca dentro de su categoría.
@@ -710,10 +758,10 @@ ORDER BY categoria, puesto, pedido_id;
 -- PUNTO 4, extensión A. La cabeza del ranking, que es el tramo que se
 -- usa para decidir. El corte va sobre el puesto y no sobre la cantidad de
 -- filas: RANK le da el mismo puesto a los empatados, así que menor o
--- igual a tres devuelve los tres primeros puestos completos, con todos
--- sus empatados adentro, en lugar de cortar un empate por la mitad. Acá
--- el primer puesto está compartido en las cinco categorías, de modo que
--- cada una devuelve tres filas con los puestos 1, 1 y 3.
+-- igual a tres devuelve los puestos hasta el tercero con todos sus
+-- empatados adentro, en lugar de cortar un empate por la mitad. Acá el
+-- primer puesto está compartido en las cinco categorías, de modo que
+-- cada una devuelve tres filas con los puestos 1, 1 y 3, sin puesto 2.
 --
 -- Se proyecta también el origen del precio, porque es la columna que
 -- explica el empate.
@@ -732,15 +780,13 @@ WHERE puesto <= 3
 ORDER BY categoria, puesto, pedido_id;
 
 -- PUNTO 4, extensión B. El mismo ranking sobre los pedidos con precio
--- original. Los que llevan precio completado toman el de lista sin
--- descuento, o sea el máximo posible de su producto, así que le ganan a
--- todos los pedidos reales del mismo artículo que sí llevaron descuento.
--- Empatan con los pocos que se cobraron al precio de lista exacto, pero
--- en la cabeza de las cinco categorías no hay ninguno de esos, de modo
--- que el empate del primer puesto queda entre dos imputados. La
--- comparación entre las dos
--- salidas muestra cuánto pesa esa decisión, que es el motivo de dejarla
--- a la vista en lugar de aplicarla en silencio sobre el ranking pedido.
+-- original. Un importe imputado equivale al precio de lista por la
+-- cantidad, que es la cota superior del artículo, de manera que domina a
+-- cualquier venta suya con descuento. Las ventas sin descuento lo
+-- igualan, y de ahí salen los empates del primer puesto; contra el
+-- ranking filtrado se ve cuántos puestos se mueven por esa causa. La
+-- comparación es el motivo de dejar las dos salidas y no aplicar el
+-- filtro en silencio sobre el ranking pedido.
 SELECT categoria, puesto, pedido_id, cliente_id, cantidad, importe, origen_del_precio
 FROM (
     SELECT v.categoria,
@@ -808,21 +854,26 @@ ORDER BY categoria, puesto, nombre;
 -- unidades de una categoría que factura cuatro millones no es lo mismo
 -- que excluirlas de una que factura ocho.
 --
--- La consulta sale de la vista y no de las tablas, para no volver a
--- escribir el COALESCE de la limpieza en un segundo lugar: la etiqueta
--- origen_del_precio ya distingue las filas que el ranking no puede usar.
-SELECT v.categoria,
+-- El recuento de productos arranca en el catálogo, con LEFT JOIN hacia
+-- la vista, para que una categoría que no vendiera nada aparezca con
+-- ceros en lugar de desaparecer: una consulta que informa exclusiones no
+-- puede excluir en silencio. Del lado de las ventas usa la vista y no
+-- las tablas, para no volver a escribir el COALESCE de la limpieza en un
+-- segundo lugar: la etiqueta origen_del_precio ya distingue las filas
+-- que el ranking no puede usar.
+SELECT pr.categoria,
        count(DISTINCT v.producto_id)
             FILTER (WHERE v.origen_del_precio <> 'Sin precio disponible')
                                                         AS productos_en_el_ranking,
-       (SELECT count(*) FROM productos pr WHERE pr.categoria = v.categoria)
-                                                        AS productos_del_catalogo,
-       sum(v.cantidad) FILTER (WHERE v.origen_del_precio = 'Sin precio disponible')
+       count(DISTINCT pr.producto_id)                   AS productos_del_catalogo,
+       COALESCE(sum(v.cantidad)
+            FILTER (WHERE v.origen_del_precio = 'Sin precio disponible'), 0)
                                                         AS unidades_fuera_del_calculo,
-       sum(v.importe)                                   AS facturacion_en_el_ranking
-FROM ventas_limpias v
-GROUP BY v.categoria
-ORDER BY unidades_fuera_del_calculo DESC;
+       COALESCE(sum(v.importe), 0)                      AS facturacion_en_el_ranking
+FROM productos pr
+LEFT JOIN ventas_limpias v ON v.producto_id = pr.producto_id
+GROUP BY pr.categoria
+ORDER BY unidades_fuera_del_calculo DESC, pr.categoria;
 
 
 -- ---------------------------------------------------------------------
@@ -832,6 +883,7 @@ ORDER BY unidades_fuera_del_calculo DESC;
 -- preguntas de negocio que pide el documento del módulo, y no reemplaza
 -- ni modifica ninguno de los cuatro puntos. Devuelve cada cliente con su
 -- cuartil de gasto.
+--
 -- Los cortes salen de la propia distribución y no de un umbral escrito a
 -- mano, que envejece mal en cuanto cambia el volumen del negocio.
 --
@@ -842,9 +894,12 @@ ORDER BY unidades_fuera_del_calculo DESC;
 -- PARTITION BY sobre (pedidos = 0) es lo que los aparta antes de repartir.
 --
 -- Caso borde: un cliente con pedidos pero con todos los importes
--- desconocidos entraría acá con gasto cero y caería en el último cuartil,
--- no en Sin actividad. En este dataset no ocurre; si ocurriera habría que
--- darle una tercera etiqueta, porque tampoco es que haya gastado poco.
+-- desconocidos entraría acá con gasto cero y no en Sin actividad. Y como
+-- NTILE reparte los empates entre los grupos, si hubiera varios así no
+-- caerían todos en el último cuartil: se distribuirían, y alguno podría
+-- salir rotulado entre los que más gastan. En este dataset no ocurre; si
+-- ocurriera habría que darles una tercera etiqueta, porque el problema
+-- de ellos no es el monto sino que no se midió.
 WITH gasto_por_cliente AS (
     SELECT c.cliente_id,
            c.nombre,
@@ -865,9 +920,11 @@ clasificados AS (
            END AS cuartil
     FROM gasto_por_cliente
 )
--- La etiqueta de salida se llama clasificacion y no cuartil: si llevara
--- el mismo nombre que la columna entera, el ORDER BY resolvería contra
--- el alias de salida y ordenaría alfabéticamente por el texto.
+-- La etiqueta de salida se llama clasificacion para dejar el nombre
+-- cuartil libre: así el ORDER BY de abajo usa el entero y se lee sin
+-- ambigüedad. Con el mismo nombre en los dos lados PostgreSQL resolvería
+-- igual contra la columna de entrada, porque el nombre está dentro de
+-- una expresión, pero el que lee el código tendría que saberlo.
 SELECT cliente_id,
        nombre,
        gasto,
@@ -957,18 +1014,21 @@ quiebre AS (
     ORDER BY gasto - gasto_siguiente DESC, puesto
     LIMIT 1
 )
-SELECT (SELECT puesto FROM quiebre)          AS clientes_arriba_del_quiebre,
-       (SELECT gasto FROM quiebre)           AS ultimo_gasto_antes_del_quiebre,
-       (SELECT gasto_siguiente FROM quiebre) AS primer_gasto_despues,
-       round(sum(o.gasto) FILTER (WHERE o.puesto <= (SELECT puesto FROM quiebre)), 2)
+-- La consulta arranca en quiebre y no en ordenados: si no hubiera
+-- quiebre, por ejemplo con un solo cliente, no devuelve nada en lugar de
+-- devolver una fila de ceros, que se leería como que la cartera no está
+-- concentrada. Un agregado sin GROUP BY siempre devuelve una fila, así
+-- que filtrar con un WHERE no alcanzaría.
+SELECT q.puesto                              AS clientes_arriba_del_quiebre,
+       q.gasto                               AS ultimo_gasto_antes_del_quiebre,
+       q.gasto_siguiente                     AS primer_gasto_despues,
+       round((SELECT sum(o.gasto) FROM ordenados o WHERE o.puesto <= q.puesto), 2)
                                              AS facturacion_arriba,
-       round(100.0 * sum(o.gasto) FILTER (WHERE o.puesto <= (SELECT puesto FROM quiebre))
-             / NULLIF(sum(o.gasto), 0), 1)   AS pct_arriba,
-       count(*) FILTER (WHERE o.puesto > (SELECT puesto FROM quiebre)) AS clientes_abajo
-FROM ordenados o
--- Sin el quiebre no hay nada que informar, y devolver ceros se leería
--- como que la cartera no está concentrada.
-WHERE EXISTS (SELECT 1 FROM quiebre);
+       round(100.0 * (SELECT sum(o.gasto) FROM ordenados o WHERE o.puesto <= q.puesto)
+             / NULLIF((SELECT sum(o.gasto) FROM ordenados o), 0), 1)
+                                             AS pct_arriba,
+       (SELECT count(*) FROM ordenados o WHERE o.puesto > q.puesto) AS clientes_abajo
+FROM quiebre q;
 
 -- PREGUNTA ADICIONAL 1, extensión C. Los dos clientes que quedan a cada
 -- lado del corte del NTILE, con sus pedidos y su ticket, para poder
@@ -986,12 +1046,29 @@ WITH gasto_por_cliente AS (
     GROUP BY c.cliente_id, c.nombre
 ),
 clasificados AS (
-    SELECT *,
+    SELECT cliente_id,
+           nombre,
+           pedidos,
+           pedidos_con_importe,
+           gasto,
            CASE WHEN pedidos = 0 THEN 0
                 ELSE NTILE(4) OVER (PARTITION BY (pedidos = 0)
                                     ORDER BY gasto DESC, cliente_id)
            END AS cuartil
     FROM gasto_por_cliente
+)
+-- Los dos se eligen por posición dentro de su cuartil y no por valor de
+-- gasto: si dos clientes empataran justo en el borde, un filtro por
+-- igualdad devolvería cuatro filas o más y la consulta dejaría de
+-- responder lo que promete.
+, bordes AS (
+    SELECT cliente_id, nombre, cuartil, pedidos, pedidos_con_importe, gasto,
+           ROW_NUMBER() OVER (PARTITION BY cuartil
+                              ORDER BY gasto ASC, cliente_id DESC)  AS desde_abajo,
+           ROW_NUMBER() OVER (PARTITION BY cuartil
+                              ORDER BY gasto DESC, cliente_id ASC)  AS desde_arriba
+    FROM clasificados
+    WHERE cuartil IN (1, 2)
 )
 SELECT cliente_id,
        nombre,
@@ -999,12 +1076,11 @@ SELECT cliente_id,
        pedidos,
        gasto,
        round(gasto / NULLIF(pedidos_con_importe, 0), 2) AS ticket_promedio,
-       gasto - LEAD(gasto) OVER (ORDER BY gasto DESC) AS diferencia_con_el_siguiente
-FROM clasificados
-WHERE cuartil IN (1, 2)
-  AND (gasto = (SELECT min(gasto) FROM clasificados WHERE cuartil = 1)
-    OR gasto = (SELECT max(gasto) FROM clasificados WHERE cuartil = 2))
-ORDER BY gasto DESC;
+       gasto - LEAD(gasto) OVER (ORDER BY gasto DESC, cliente_id) AS diferencia_con_el_siguiente
+FROM bordes
+WHERE (cuartil = 1 AND desde_abajo = 1)
+   OR (cuartil = 2 AND desde_arriba = 1)
+ORDER BY gasto DESC, cliente_id;
 
 -- PREGUNTA ADICIONAL 1, extensión D. Quiénes son los que nunca
 -- compraron. La pregunta que sigue naturalmente es si se trata de un
@@ -1017,7 +1093,7 @@ SELECT c.cliente_id,
        (SELECT max(fecha_alta) FROM clientes) - c.fecha_alta AS dias_desde_la_ultima_alta
 FROM clientes c
 WHERE NOT EXISTS (SELECT 1 FROM pedidos p WHERE p.cliente_id = c.cliente_id)
-ORDER BY c.fecha_alta DESC;
+ORDER BY c.fecha_alta DESC, c.cliente_id;
 
 
 -- ---------------------------------------------------------------------
@@ -1036,10 +1112,9 @@ ORDER BY facturacion DESC, canal;
 -- PREGUNTA ADICIONAL 2, extensión A. El mismo corte con lo que hace
 -- falta para saber si un canal vende distinto o solamente vende más: el
 -- ticket promedio y de qué antigüedad de cliente viene la plata. Sirve
--- para repartir
--- presupuesto comercial, porque un canal que trae volumen de clientes
--- nuevos y otro que sostiene a los históricos piden inversiones
--- distintas.
+-- para repartir presupuesto comercial, porque un canal que trae volumen
+-- de clientes nuevos y otro que sostiene a los históricos piden
+-- inversiones distintas.
 --
 -- El cruce por segmento se arma con FILTER sobre la misma pasada en lugar
 -- de tres consultas separadas.
@@ -1081,6 +1156,46 @@ WHERE fecha_pedido BETWEEN DATE '2025-01-01' AND DATE '2025-01-31';
 EXPLAIN (COSTS OFF)
 SELECT DATE_TRUNC('month', fecha_pedido), sum(importe) FROM ventas_limpias
 GROUP BY 1;
+
+-- ANEXO. Las comparaciones que el informe menciona, ejecutadas.
+-- Cada una de estas tres cosas estaba afirmada en el texto y hasta acá
+-- había que creerla; van con su salida al lado para que no haya que
+-- hacerlo.
+--
+-- Primero, el contrafáctico del punto 3: qué devolvería la consulta de
+-- los tres productos menos vendidos con INNER JOIN en lugar de LEFT
+-- JOIN. La diferencia es la respuesta entera, no un matiz.
+SELECT pr.producto_id,
+       pr.nombre,
+       sum(p.cantidad) AS unidades_vendidas
+FROM productos pr
+JOIN pedidos p ON p.producto_id = pr.producto_id
+GROUP BY pr.producto_id, pr.nombre
+ORDER BY unidades_vendidas ASC, pr.producto_id ASC
+LIMIT 3;
+
+-- Lo mismo para la primera pregunta adicional: con INNER JOIN los diez
+-- clientes que nunca compraron no aparecen, y el padrón que se segmenta
+-- pasa de 200 a 190.
+SELECT count(*) AS clientes_con_left_join
+FROM clientes c
+WHERE TRUE
+UNION ALL
+SELECT count(DISTINCT c.cliente_id)
+FROM clientes c
+JOIN ventas_limpias v ON v.cliente_id = c.cliente_id;
+
+-- Y la concentración que los comentarios del generador afirman, medida:
+-- cuánto pesan los veinticinco primeros clientes y los ocho artículos de
+-- mayor rotación sobre el total de pedidos.
+SELECT count(*)                                              AS pedidos_totales,
+       count(*) FILTER (WHERE cliente_id <= 25)              AS de_los_25_primeros_clientes,
+       round(100.0 * count(*) FILTER (WHERE cliente_id <= 25)
+             / NULLIF(count(*), 0), 1)                       AS pct_clientes,
+       count(*) FILTER (WHERE producto_id <= 8)              AS de_los_8_de_mas_rotacion,
+       round(100.0 * count(*) FILTER (WHERE producto_id <= 8)
+             / NULLIF(count(*), 0), 1)                       AS pct_productos
+FROM pedidos;
 
 -- Y los dos planes que justifican los índices de las claves foráneas,
 -- que no se usan en los cruces sino en las consultas de existencia del
