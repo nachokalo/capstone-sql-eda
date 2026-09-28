@@ -232,6 +232,11 @@ SELECT count(*)                                                 AS pedidos_imput
              / NULLIF(sum(v.cantidad * pr.precio_lista), 0), 2)  AS sobreestimacion_pct
 FROM ventas_limpias v
 JOIN productos pr            ON pr.producto_id = v.producto_id
+-- El cruce es interno: si algún artículo imputado no tuviera ninguna
+-- venta con precio propio, sus pedidos desaparecerían de la estimación
+-- en silencio. El conteo de la primera columna es lo que permite
+-- comprobar que no pasó, porque tiene que dar los mismos 416 que informa
+-- el perfilado de más arriba.
 JOIN cobrado_por_producto c  ON c.producto_id  = v.producto_id
 WHERE v.origen_del_precio = 'Completado con precio de lista';
 
@@ -242,9 +247,9 @@ WHERE v.origen_del_precio = 'Completado con precio de lista';
 -- válida si cambian los datos.
 --
 -- Es el promedio por pedido y no el ponderado por importe. Ponderar
--- mueve la corrección menos de mil pesos sobre ciento sesenta mil, así
--- que no cambia ninguna conclusión, pero conviene decir cuál de los dos
--- es.
+-- mueve la corrección menos de mil pesos sobre ciento sesenta mil, o sea
+-- que no cambia ninguna conclusión, pero conviene aclarar cuál de los
+-- dos se usó.
 WITH descuento AS (
     SELECT avg(1 - p.precio_unitario / pr.precio_lista) AS factor
     FROM pedidos p
@@ -356,6 +361,41 @@ SELECT cruce,
        END AS control
 FROM controles
 ORDER BY cruce;
+
+-- La tabla de arriba informa; este bloque exige. Si alguno de los cruces
+-- multiplicara filas, el script corta acá en lugar de seguir y producir
+-- un informe con todos los totales inflados, que es la forma en que este
+-- error se cuela sin que nada falle.
+DO $$
+DECLARE
+    base int := (SELECT count(*) FROM pedidos);
+BEGIN
+    IF (SELECT count(*) FROM ventas_limpias) <> base THEN
+        RAISE EXCEPTION 'El cruce de pedidos con productos multiplicó filas';
+    END IF;
+    IF (SELECT count(*) FROM ventas_limpias v
+        JOIN clientes c ON c.cliente_id = v.cliente_id) <> base THEN
+        RAISE EXCEPTION 'El cruce de ventas con clientes multiplicó filas';
+    END IF;
+    IF (SELECT count(*) FROM ventas_limpias v
+        JOIN productos pr ON pr.producto_id = v.producto_id) <> base THEN
+        RAISE EXCEPTION 'El cruce de ventas con productos multiplicó filas';
+    END IF;
+
+    -- Los tipos que el análisis da por sentados.
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'public'
+                 AND table_name IN ('clientes','productos','pedidos')
+                 AND ((column_name IN ('precio_lista','costo','precio_unitario')
+                       AND data_type <> 'numeric')
+                   OR (column_name IN ('fecha_pedido','fecha_alta')
+                       AND data_type <> 'date')
+                   OR character_maximum_length IS NOT NULL)) THEN
+        RAISE EXCEPTION 'Hay columnas con un tipo distinto del que el análisis supone';
+    END IF;
+
+    RAISE NOTICE 'Cardinalidad de los tres cruces y tipos de dato: verificados.';
+END $$;
 
 
 -- #####################################################################
@@ -913,7 +953,43 @@ FROM ordenados o
 -- como que la cartera no está concentrada.
 WHERE EXISTS (SELECT 1 FROM quiebre);
 
--- PREGUNTA ADICIONAL 1, extensión C. Quiénes son los que nunca
+-- PREGUNTA ADICIONAL 1, extensión C. Los dos clientes que quedan a cada
+-- lado del corte del NTILE, con sus pedidos y su ticket, para poder
+-- juzgar si esa frontera es un dato o una casualidad. Mismo criterio que
+-- la extensión B del punto 1, donde se mira la frontera del quinto
+-- puesto.
+WITH gasto_por_cliente AS (
+    SELECT c.cliente_id,
+           c.nombre,
+           count(v.pedido_id)          AS pedidos,
+           count(v.importe)            AS pedidos_con_importe,
+           COALESCE(sum(v.importe), 0) AS gasto
+    FROM clientes c
+    LEFT JOIN ventas_limpias v ON v.cliente_id = c.cliente_id
+    GROUP BY c.cliente_id, c.nombre
+),
+clasificados AS (
+    SELECT *,
+           CASE WHEN pedidos = 0 THEN 0
+                ELSE NTILE(4) OVER (PARTITION BY (pedidos = 0)
+                                    ORDER BY gasto DESC, cliente_id)
+           END AS cuartil
+    FROM gasto_por_cliente
+)
+SELECT cliente_id,
+       nombre,
+       cuartil,
+       pedidos,
+       gasto,
+       round(gasto / NULLIF(pedidos_con_importe, 0), 2) AS ticket_promedio,
+       gasto - LEAD(gasto) OVER (ORDER BY gasto DESC) AS diferencia_con_el_siguiente
+FROM clasificados
+WHERE cuartil IN (1, 2)
+  AND (gasto = (SELECT min(gasto) FROM clasificados WHERE cuartil = 1)
+    OR gasto = (SELECT max(gasto) FROM clasificados WHERE cuartil = 2))
+ORDER BY gasto DESC;
+
+-- PREGUNTA ADICIONAL 1, extensión D. Quiénes son los que nunca
 -- compraron. La pregunta que sigue naturalmente es si se trata de un
 -- problema de captación vieja o de altas recientes que no convirtieron, y
 -- eso lo contesta la fecha de alta.

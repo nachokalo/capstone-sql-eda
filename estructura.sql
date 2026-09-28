@@ -143,11 +143,12 @@ FROM generate_series(1, 200) AS g;
 -- Dos recaudos para que los artículos sin precio cargado se parezcan a
 -- un dato faltante de verdad. El precio base es cuadrático sobre el
 -- número de artículo y da varias vueltas sobre el módulo 9800, de modo
--- que no crece de forma ordenada y la interpolación entre vecinos falla
--- en cuatro de los seis casos, con errores que van de cerca del
--- cincuenta por ciento a más de dos mil. Y
--- el margen toma un valor propio en cada artículo, así que tampoco se
--- lee del artículo de al lado.
+-- que no crece de forma ordenada: interpolar entre los dos vecinos del
+-- catálogo falla en cuatro de los seis casos, con errores de entre el
+-- cincuenta por ciento y más de dos mil, y acierta en los otros dos por
+-- casualidad, con menos del dos por ciento de error. El segundo recaudo
+-- es el margen, que toma un valor propio en cada artículo, así que el
+-- artículo de al lado tampoco lo delata.
 --
 -- Ninguno de los dos vuelve el hueco irreconstruible, y conviene decirlo
 -- acá en lugar de dejarlo para que lo descubra el lector: sobre un
@@ -162,9 +163,10 @@ SELECT
     (ARRAY['Electrónica','Hogar','Indumentaria','Deportes',
            'Librería'])[1 + (g % 5)],
     -- Seis artículos quedan sin precio de lista. El módulo 9 es coprimo
-    -- con el 5 de la categoría, así que el hueco no se concentra en un
-    -- rubro, y la condición sobre los ocho primeros lo mantiene lejos de
-    -- los artículos de mayor rotación.
+    -- con el 5 de la categoría, de modo que el hueco se reparte: cinco
+    -- rubros con uno cada uno y Deportes con dos, que es el sobrante de
+    -- dividir seis entre cinco. La condición sobre los ocho primeros lo
+    -- mantiene lejos de los artículos de mayor rotación.
     CASE WHEN g % 9 = 4 AND g > 8 THEN NULL
          ELSE round((200 + ((g * g * 97 + g * 41) % 9800))::numeric, 2)
     END,
@@ -317,6 +319,11 @@ FROM pedidos;
 
 -- Tres controles de integridad que sí pueden fallar, con el resultado
 -- escrito al lado para que no haya que deducirlo de la salida.
+--
+-- La tabla de abajo los informa, y el bloque que sigue los exige: si uno
+-- fallara, el script corta con error en lugar de imprimir ALERTA y
+-- seguir. La diferencia importa, porque un control que solo escribe una
+-- palabra depende de que alguien la lea.
 SELECT 'ningún pedido anterior al alta de su cliente' AS control,
        count(*) AS casos,
        CASE WHEN count(*) = 0 THEN 'OK' ELSE 'ALERTA' END AS resultado
@@ -341,6 +348,47 @@ WHERE table_schema = 'public'
   AND table_name IN ('productos','pedidos')
   AND column_name IN ('precio_lista','costo','precio_unitario')
   AND data_type <> 'numeric';
+
+DO $$
+DECLARE
+    fallas int;
+BEGIN
+    SELECT count(*) INTO fallas
+    FROM pedidos p
+    JOIN clientes c ON c.cliente_id = p.cliente_id
+    WHERE p.fecha_pedido < c.fecha_alta;
+    IF fallas > 0 THEN
+        RAISE EXCEPTION 'Hay % pedidos anteriores al alta de su cliente', fallas;
+    END IF;
+
+    SELECT count(*) INTO fallas
+    FROM productos
+    WHERE precio_lista IS NOT NULL AND costo >= precio_lista;
+    IF fallas > 0 THEN
+        RAISE EXCEPTION 'Hay % artículos con costo mayor o igual al precio de lista', fallas;
+    END IF;
+
+    SELECT count(*) INTO fallas
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name IN ('productos','pedidos')
+      AND column_name IN ('precio_lista','costo','precio_unitario')
+      AND data_type <> 'numeric';
+    IF fallas > 0 THEN
+        RAISE EXCEPTION 'Hay % columnas de dinero fuera de NUMERIC', fallas;
+    END IF;
+
+    -- Volumen esperado de la carga. Si el generador cambiara y las
+    -- cantidades se movieran, conviene enterarse acá y no al leer un
+    -- número raro en el informe.
+    IF (SELECT count(*) FROM clientes)  <> 200  THEN RAISE EXCEPTION 'clientes no cargó 200 filas';  END IF;
+    IF (SELECT count(*) FROM productos) <> 60   THEN RAISE EXCEPTION 'productos no cargó 60 filas';  END IF;
+    IF (SELECT count(DISTINCT fecha_pedido) FROM pedidos) <> 730 THEN
+        RAISE EXCEPTION 'la carga no cubre los 730 días del período';
+    END IF;
+
+    RAISE NOTICE 'Controles de integridad: los seis pasaron.';
+END $$;
 
 -- Tipos declarados de las tres tablas, completos. Se listan todas las
 -- columnas y no solo las de fecha y dinero, porque parte de lo que hay

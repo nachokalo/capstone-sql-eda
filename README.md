@@ -2,7 +2,7 @@
 
 Proyecto Capstone de la cursada de SQL. Ignacio Kalogiannidis. PostgreSQL 16.
 
-Análisis de dos años de operación de una tienda online: modelo de datos, etapa de limpieza y análisis en SQL, escrito para que lo lea quien tiene que tomar las decisiones y no solamente quien revisa el código. Se resuelven los cuatro puntos de análisis del enunciado, que pedía al menos tres, más dos preguntas adicionales: seis en total, con lo que se pasan las cinco preguntas de negocio que pide el documento del módulo.
+Análisis de dos años de operación de una tienda online: modelo de datos, etapa de limpieza y análisis en SQL, escrito para que lo lea quien tiene que tomar las decisiones y no solamente quien revisa el código. Están resueltos los cuatro puntos de análisis del enunciado, que pedía un mínimo de tres, y se agregan dos preguntas más. Son seis, por encima de las cinco preguntas de negocio que pide el documento del módulo.
 
 ## El trabajo en una tabla
 
@@ -40,7 +40,7 @@ La opción `ON_ERROR_STOP=1` hace que la ejecución corte ante el primer error e
 
 El primero crea las tres tablas y carga los datos. El segundo perfila, limpia y analiza. Es de lectura salvo por la vista `ventas_limpias`, que crea al principio.
 
-Los dos se pueden volver a correr sobre la misma base. `estructura.sql` empieza eliminando lo que va a recrear, incluida la vista que crea el otro script, y `analisis.sql` usa `CREATE OR REPLACE` sobre esa vista. Se verificó corriendo los dos tres veces seguidas sobre la misma base y una cuarta sobre una base recién creada: la salida de las consultas es idéntica en las cuatro. Lo único que cambia son los avisos de la primera corrida contra una base vacía, donde los `DROP ... IF EXISTS` informan que no había nada que borrar.
+Los dos se pueden volver a correr sobre la misma base. `estructura.sql` empieza eliminando lo que va a recrear, incluida la vista que crea el otro script, y `analisis.sql` usa `CREATE OR REPLACE` sobre esa vista. Se verificó corriendo los dos tres veces seguidas sobre la misma base y una cuarta sobre una base recién creada: la salida de las consultas es idéntica en las cuatro. Lo único que cambia son los avisos: en la primera corrida contra una base vacía los `DROP ... IF EXISTS` informan que no había nada que borrar. Los dos scripts avisan además, en cada corrida, que los controles pasaron.
 
 Los datos se generan con aritmética modular sobre `generate_series`, sin `random()`. Así cualquiera que clone el repositorio y ejecute los scripts obtiene exactamente las mismas filas y puede reproducir todos los números de este documento.
 
@@ -56,7 +56,7 @@ Los datos se generan con aritmética modular sobre `generate_series`, sin `rando
 
 El enunciado pide resolver al menos tres de sus cuatro puntos de análisis. Están los cuatro. A eso se suman dos preguntas adicionales, marcadas como tales, que no reemplazan ni modifican ninguno de los cuatro.
 
-Cada punto se resuelve primero con la consulta tal como la pide el enunciado, sin columnas de más, y después con una o varias extensiones rotuladas que agregan lo que hace falta para decidir. En `analisis.sql` cada bloque lleva su rótulo en el comentario, del tipo `PUNTO 4, extensión B`, así que se encuentran buscando esa palabra.
+Cada punto se resuelve primero con la consulta en la forma exacta del enunciado, sin columnas de más, y después con una o varias extensiones rotuladas que agregan lo que hace falta para decidir. En `analisis.sql` cada bloque lleva su rótulo en el comentario, del tipo `PUNTO 4, extensión B`, así que se encuentran buscando esa palabra.
 
 | Punto del enunciado | Bloque en `analisis.sql` | Hallazgo en este documento |
 |---|---|---|
@@ -67,7 +67,7 @@ Cada punto se resuelve primero con la consulta tal como la pide el enunciado, si
 
 | Pregunta adicional | Bloque en `analisis.sql` | Hallazgo en este documento |
 |---|---|---|
-| Segmentación de clientes en cuartiles con `NTILE(4)` | PREGUNTA ADICIONAL 1, más extensiones A, B y C | La segmentación de clientes en cuartiles |
+| Segmentación de clientes en cuartiles con `NTILE(4)` | PREGUNTA ADICIONAL 1, más extensiones A, B, C y D | La segmentación de clientes en cuartiles |
 | La facturación por canal de venta | PREGUNTA ADICIONAL 2, más extensión A | La facturación por canal de venta |
 
 ## El modelo de datos: diagrama ER
@@ -109,6 +109,8 @@ El esquema son tres tablas y una sola relación que importa: `pedidos` cuelga de
 
 Los tipos se eligieron para no tener que limpiar después: `DATE` para las fechas, `NUMERIC(10,2)` para el dinero y `TEXT` para el texto. El detalle de por qué cada uno está en el comentario de la sección 2 de `estructura.sql`, y el primer bloque de `analisis.sql` verifica que ninguna columna se haya escapado de ese criterio, con un resultado OK o ALERTA escrito al lado.
 
+Esos controles, y los de integridad de `estructura.sql`, además de informar, exigen: los dos scripts llevan un bloque que corta la ejecución con error si alguno falla. La razón es que una palabra impresa en una salida larga puede pasar inadvertida. Con la excepción, si el día de mañana un cruce multiplica filas o una columna de dinero queda en punto flotante, el script no produce un informe con los totales mal: no produce nada.
+
 Las restricciones acompañan esa decisión. El email lleva `UNIQUE` porque identifica al cliente, más un `CHECK` de formato. Las cantidades y los importes llevan `CHECK` de signo: un valor negativo ahí es una carga mal hecha y conviene que la base lo rechace antes de que llegue a una suma. Canal, categoría y segmento son dominios cerrados y se declaran como tales, para que un error de tipeo no invente una quinta categoría que después aparezca como una fila suelta en cada agrupación. Y las claves foráneas impiden un pedido de un cliente o un producto que no existen.
 
 De índices se creó lo mínimo: las dos claves foráneas, por donde `pedidos` se cruza con las otras dos tablas y que PostgreSQL deja sin indexar, y un B-Tree sobre `fecha_pedido`, que es la columna del `WHERE` y del `GROUP BY` de la serie mensual. `canal` y `categoria` quedaron afuera: tienen tan pocos valores distintos que un índice no descarta casi nada, y cada índice de más se paga en cada escritura. El cierre de `analisis.sql` muestra dos planes con `EXPLAIN (COSTS OFF)`: al filtrar por un rango de fechas el planificador elige entrar por `idx_pedidos_fecha` con un Bitmap Index Scan, y al agrupar la serie completa resuelve con recorrido secuencial, que sobre este volumen es lo esperable. Los índices de las claves foráneas, en cambio, el análisis los usa en los `NOT EXISTS` del punto 3 y de la primera pregunta adicional, no en los cruces, que sobre estas tablas el planificador resuelve por Hash Join.
@@ -135,7 +137,7 @@ El análisis verifica además que ese hueco no esté concentrado, y lo hace por 
 
 Con las fechas la decisión fue la inversa. No hay forma de estimar la fecha de un pedido a partir del resto de la fila, y una fecha inventada contamina cualquier serie temporal sin dejar rastro. Lo que sí se hizo con `COALESCE` fue etiquetar: la columna `periodo` de la vista limpia devuelve el mes del pedido, o la etiqueta "Sin fecha" cuando falta. Así esos pedidos no desaparecen del informe sin que nadie lo note, sino que se reportan como su propio período. Son 1.088.029,65 de facturación que quedan fuera de cualquier análisis temporal.
 
-La limpieza se resuelve una sola vez, en la vista `ventas_limpias`, y todas las consultas parten de ahí salvo cuatro, que miden unidades o antigüedad y no necesitan el precio: la del punto 3 y su extensión A, la extensión D del punto 4 y la extensión C de la primera pregunta adicional. Esas van directamente contra las tablas. Centralizarla evita lo que sale caro de repetirla: bastaría un solo `COALESCE` olvidado para que dos secciones del informe informaran totales distintos.
+La limpieza se resuelve una sola vez, en la vista `ventas_limpias`, y todas las consultas parten de ahí salvo cuatro, que miden unidades o antigüedad y no necesitan el precio: la del punto 3 y su extensión A, y la extensión D de la primera pregunta adicional. Esas van directamente contra las tablas. Centralizarla evita lo que sale caro de repetirla: bastaría un solo `COALESCE` olvidado para que dos secciones del informe informaran totales distintos.
 
 Por último, el análisis compara el conteo de filas antes y después del JOIN, en los tres cruces que usa. Las 4.889 filas de `pedidos` siguen siendo 4.889 después de unir con `productos`, con `clientes` y con el catálogo para el ranking. El comentario de la sección 1.4 de `analisis.sql` explica por qué ese control merece una consulta propia.
 
@@ -153,7 +155,7 @@ Facturación total del período, después de la limpieza: 35.288.934,22, reparti
 | Elena Escobar | 753.973,54 | 2,14 por ciento |
 | Bruno Benítez | 744.360,81 | 2,11 por ciento |
 
-Ninguno pesa lo suficiente como para que perderlo sea un problema: los cinco juntos explican el 11,02 por ciento de la facturación. Todos son clientes históricos, con entre 94 y 101 pedidos cada uno y tickets de entre 7.936,56 y 8.572,30, o sea que lo que los pone arriba es la cantidad de compras.
+Ninguno pesa lo suficiente como para que perderlo sea un problema: los cinco juntos explican el 11,02 por ciento de la facturación. Todos son clientes históricos, con entre 94 y 101 pedidos cada uno y tickets de entre 7.936,56 y 8.572,30, calculados sobre los pedidos cuyo importe se conoce, que no son todos. Lo que los pone arriba es la cantidad de compras.
 
 Hay una reserva que el propio análisis deja a la vista. El quinto puesto le saca al sexto 754,10 pesos, mientras que cada uno de esos dos clientes arrastra cuatro o cinco pedidos sin importe conocido, que valen miles. El orden de los cinco primeros es el que la base permite calcular, pero la frontera del quinto puesto no es una conclusión firme: cargar los precios que faltan la puede dar vuelta.
 
@@ -177,9 +179,9 @@ Esa lista aparece porque la consulta une con `LEFT JOIN` desde `productos`. Un `
 
 ### Ranking de pedidos por categoría con RANK()
 
-El ranking sale entero: una fila por cada uno de los 4.571 pedidos con importe conocido, con el puesto que le toca dentro de su categoría. Una extensión aparte repite la cabeza de cada categoría, que es el tramo que se lee para decidir, y ahí aparece algo que conviene revisar antes de leer nada: en las cinco el primer puesto está empatado entre dos pedidos, y los diez tienen el precio completado por la limpieza. La explicación es aritmética. Al imputar el precio de lista, sin descuento, esos pedidos toman el importe máximo posible de su producto, así que le ganan a cualquier pedido real del mismo artículo y empatan entre sí.
+El ranking sale entero: una fila por cada uno de los 4.571 pedidos con importe conocido, y en cada una el puesto que ocupa dentro de su rubro. Una extensión aparte repite la cabeza de cada categoría, que es el tramo que se lee para decidir, y ahí aparece algo que conviene revisar antes de leer nada: en las cinco el primer puesto está empatado entre dos pedidos, y los diez tienen el precio completado por la limpieza. La explicación es aritmética. Al imputar el precio de lista, sin descuento, esos pedidos toman el importe máximo posible de su producto, así que le ganan a cualquier pedido real del mismo artículo y empatan entre sí.
 
-Por eso hay una tercera versión, con el mismo ranking restringido a los pedidos con precio original. Ahí los empates desaparecen y el podio queda formado por pedidos que se cobraron de verdad. La comparación entre las dos salidas es el resultado que importa de este punto: un ranking construido sobre datos imputados premia a las filas estimadas, y la forma de verlo es dejar las dos versiones a la vista en lugar de aplicar el filtro en silencio.
+Por eso hay una tercera versión, con el mismo ranking restringido a los pedidos con precio original. Ahí los empates desaparecen y el podio queda formado por pedidos que se cobraron de verdad. La comparación entre las dos salidas es el resultado que importa de este punto: cuando el valor imputado es el máximo posible de su producto, el ranking premia a las filas estimadas, y la forma de verlo es dejar las dos versiones a la vista en lugar de aplicar el filtro en silencio.
 
 Como decisión de negocio, el ranking de pedidos rinde poco: cada fila es una compra suelta y no dice nada del artículo detrás. La extensión que agrupa por producto es la que responde de qué artículos depende cada categoría, y ahí sí aparece una diferencia grande entre rubros. En Deportes el Producto 008 se lleva el 38,3 por ciento de la facturación de su categoría, y en Electrónica el Producto 005 llega al 30,0, mientras que en Librería el primero apenas alcanza el 17,0 y los tres primeros quedan dentro de cuatro puntos entre sí. La explicación está en la misma tabla y tiene dos patas, porque la facturación de un artículo es unidades por precio y hace falta mirar las dos columnas. Los primeros puestos de Deportes, Electrónica, Hogar e Indumentaria son artículos de mucha rotación, con entre 461 y 471 unidades contra las 122 a 131 del resto. Librería también tiene uno de esos, el Producto 004 con 462 unidades, pero es barato y queda cuarto, detrás de tres artículos de poca rotación y mucho precio. Es decir que concentra la categoría que tiene un artículo que junta las dos cosas, y no la que tiene el artículo más vendido ni la que tiene el más caro.
 
@@ -193,7 +195,7 @@ El primer cuartil, 48 de los 190 clientes que compraron, explica el 58,5 por cie
 
 Eso cambia qué acción corresponde. No se trata de clientes que compran caro, sino de clientes que compran seguido, así que lo que hay que proteger es la frecuencia: un programa de retención sobre ellos vale más que cualquier intento de subirles el ticket.
 
-Hay que precisar dónde termina ese grupo. `NTILE(4)` corta por cantidad de clientes y no por quiebre de la distribución, y las dos cosas no coinciden. El corte entre el primer cuartil y el segundo separa a un cliente de 130.461,82 de otro de 130.195,14: menos de trescientos pesos, que es una fracción de un solo pedido de cualquiera de los dos. Esa frontera no es un dato firme. El quiebre real de la distribución está bastante más arriba: el salto más grande entre dos clientes consecutivos cae entre el puesto 25 y el 26, donde el gasto pasa de 577.406,48 a 175.950,39. Esos 25 primeros explican el 49,1 por ciento de la facturación, casi tanto como los otros 165 juntos. Los clientes de la parte baja del primer cuartil se parecen mucho más a los del segundo que a los de arriba. El programa conviene armarlo sobre los primeros 25.
+Hay que precisar dónde termina ese grupo. `NTILE(4)` corta por cantidad de clientes y no por quiebre de la distribución, y las dos cosas no coinciden. El corte entre el primer cuartil y el segundo separa a Facundo Benítez, con 130.461,82, de Hernán Ibarra, con 130.195,14. Son 266,68 pesos entre dos clientes que hicieron quince pedidos cada uno con tickets de 8.697,45 y 8.679,68: lo que los separa es una fracción de una sola compra de cualquiera de los dos. Esa frontera no es un dato. El quiebre real de la distribución está bastante más arriba: el salto más grande entre dos clientes consecutivos cae entre el puesto 25 y el 26, donde el gasto pasa de 577.406,48 a 175.950,39. Esos 25 primeros explican el 49,1 por ciento de la facturación, casi tanto como los otros 165 juntos. Los clientes de la parte baja del primer cuartil se parecen mucho más a los del segundo que a los de arriba. El programa conviene armarlo sobre los primeros 25.
 
 Los cuartiles se calculan sobre los 190 clientes que compraron, y los 10 sin actividad quedan en una categoría aparte en lugar de diluirse dentro del último cuartil. Separarlos importa para la lectura: mezclados, el cuartil de menor gasto parecería peor de lo que es, cuando en realidad el problema de esos diez no es que gasten poco sino que nunca empezaron. Aparecen porque la consulta usa `LEFT JOIN` desde `clientes`; con un `INNER JOIN` no existirían en el informe.
 
