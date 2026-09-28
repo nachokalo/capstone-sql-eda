@@ -6,7 +6,7 @@
 --
 -- Ejecución:
 --   createdb capstone_project
---   psql -d capstone_project -f estructura.sql
+--   psql -v ON_ERROR_STOP=1 -d capstone_project -f estructura.sql
 --
 -- El script se puede correr varias veces sobre la misma base: empieza
 -- eliminando todo lo que va a recrear.
@@ -40,6 +40,10 @@ DROP TABLE IF EXISTS clientes;
 -- de aceptarla como cadena. El dinero va en NUMERIC y no en punto
 -- flotante: NUMERIC es de precisión exacta y el error de redondeo del
 -- flotante se vuelve visible al sumar miles de importes.
+--
+-- El texto va en TEXT y no en VARCHAR(n) porque ninguna de estas
+-- columnas tiene un largo máximo que sea regla del negocio, y en
+-- PostgreSQL los dos tipos se almacenan igual.
 
 CREATE TABLE clientes (
     cliente_id  INT  PRIMARY KEY,
@@ -104,10 +108,16 @@ CREATE TABLE pedidos (
 -- Los datos se generan con generate_series y aritmética modular, sin
 -- random(), para que cualquiera que ejecute el script obtenga las mismas
 -- filas y pueda reproducir los números del README.
+--
+-- La carga va dentro de una transacción: si algo fallara en el medio, la
+-- base quedaría con las tablas creadas y los datos a la mitad, y el
+-- script de análisis correría sobre eso sin que nada avisara.
+BEGIN;
 
 -- 3.1. Clientes
 -- Las altas van todas en 2023, antes del primer pedido, para que ningún
--- cliente figure comprando antes de existir.
+-- cliente figure comprando antes de existir. Van en orden de id, así que
+-- los últimos del padrón son las altas más recientes.
 INSERT INTO clientes (cliente_id, nombre, email, ciudad, segmento, fecha_alta)
 SELECT
     g,
@@ -123,86 +133,112 @@ SELECT
     CASE WHEN g <= 40  THEN 'Histórico'
          WHEN g <= 120 THEN 'Recurrente'
          ELSE 'Nuevo' END,
-    DATE '2023-01-01' + (g * 3 % 360)
+    DATE '2023-01-01' + ((g - 1) * 9 / 5)
 FROM generate_series(1, 200) AS g;
 
 -- 3.2. Productos
 -- Costo y precio de lista salen del mismo valor base, así que ningún
--- artículo cuesta más de lo que se vende. El margen va del cuarenta al
--- sesenta por ciento según el artículo: con un margen único se podría
--- despejar el precio de lista dividiendo el costo, y los productos que
--- no lo tienen cargado dejarían de ser un dato faltante real.
+-- artículo cuesta más de lo que se vende.
+--
+-- Dos recaudos para que los artículos sin precio cargado se parezcan a
+-- un dato faltante de verdad. El precio base es cuadrático sobre el
+-- número de artículo y da varias vueltas sobre el módulo 9800, de modo
+-- que no crece de forma ordenada y la interpolación entre vecinos falla
+-- en cuatro de los seis casos, con errores que van de cerca del
+-- cincuenta por ciento a más de dos mil. Y
+-- el margen toma un valor propio en cada artículo, así que tampoco se
+-- lee del artículo de al lado.
+--
+-- Ninguno de los dos vuelve el hueco irreconstruible, y conviene decirlo
+-- acá en lugar de dejarlo para que lo descubra el lector: sobre un
+-- dataset determinista, quien despeje las fórmulas del generador
+-- reconstruye cualquier valor. Lo que se busca es que no se despeje
+-- desde las tablas, que es la información con la que trabaja el
+-- análisis.
 INSERT INTO productos (producto_id, nombre, categoria, precio_lista, costo, stock, activo)
 SELECT
     g,
     'Producto ' || lpad(g::text, 3, '0'),
     (ARRAY['Electrónica','Hogar','Indumentaria','Deportes',
            'Librería'])[1 + (g % 5)],
-    -- Seis artículos quedan sin precio de lista. El módulo 9 los reparte
-    -- entre las cinco categorías, y la guarda sobre los ocho primeros
-    -- evita que el hueco caiga sobre los artículos de mayor rotación.
+    -- Seis artículos quedan sin precio de lista. El módulo 9 es coprimo
+    -- con el 5 de la categoría, así que el hueco no se concentra en un
+    -- rubro, y la condición sobre los ocho primeros lo mantiene lejos de
+    -- los artículos de mayor rotación.
     CASE WHEN g % 9 = 4 AND g > 8 THEN NULL
-         ELSE round((200 + (g * 137 % 9800))::numeric, 2)
+         ELSE round((200 + ((g * g * 97 + g * 41) % 9800))::numeric, 2)
     END,
-    round((200 + (g * 137 % 9800))::numeric * (0.40 + (g % 5) * 0.05), 2),
-    10 + (g * 7 % 40),
+    round((200 + ((g * g * 97 + g * 41) % 9800))::numeric
+          * (0.40 + (g * 37 % 60) * 0.003), 2),
+    -- El módulo 41 es primo, de modo que el stock no queda emparejado
+    -- con la categoría ni con el precio.
+    10 + (g * 11 % 41),
     (g % 12 <> 0)
 FROM generate_series(1, 60) AS g;
 
 -- 3.3. Pedidos
--- La fecha usa el resto de multiplicar por 367, coprimo con 730, así que
--- recorre los 730 días del período sin repetir hasta agotarlos. El total
--- es 5110 porque son siete vueltas exactas: con un número que no fuera
--- múltiplo del período, los pedidos de la vuelta incompleta se
--- amontonarían sobre los primeros meses y simularían una caída inexistente.
+-- La fecha sale de g * 367 % 730. El 367 es coprimo con 730, así que
+-- recorre los 730 días del período sin repetir ninguno antes de
+-- agotarlos todos. Y el total de filas, 5110, es múltiplo exacto de 730:
+-- siete vueltas completas. Si no lo fuera, la vuelta incompleta cargaría
+-- de más los primeros meses y aparecería una caída que el negocio no
+-- tiene.
 --
--- Sobre esa base pareja se descarta uno de cada once pedidos del segundo
--- año. El divisor once es coprimo con los que asignan cliente, producto,
--- cantidad y canal, de manera que el recorte cae parejo sobre todos ellos
--- en lugar de sacar de más los pedidos caros.
+-- Sobre esa base pareja se descartan dos de cada veintitrés pedidos del
+-- segundo año, que es la retracción que el escenario simula. El corte va
+-- en el día 366 y no en el 365 porque 2024 es bisiesto: contado desde el
+-- 1 de enero de 2024, el día 365 todavía es el 31 de diciembre de 2024.
 INSERT INTO pedidos (pedido_id, cliente_id, producto_id, cantidad,
                      precio_unitario, fecha_pedido, canal)
 SELECT
     s.g,
     -- Cartera desbalanceada: los primeros veinticinco clientes se quedan
-    -- con algo más del cuarenta por ciento de los pedidos. El módulo 190
-    -- deja además sin ninguna compra a los últimos diez del padrón.
-    CASE WHEN s.g % 3 = 0 THEN 1 + (s.g * 7 % 25)
+    -- con casi la mitad de los pedidos. El módulo 190 deja además sin
+    -- ninguna compra a los diez últimos del padrón, que por el orden de
+    -- las altas son los diez ingresos más recientes.
+    CASE WHEN s.g % 17 < 7 THEN 1 + (s.g * 7 % 25)
          ELSE 1 + (s.g * 13 % 190) END,
     -- La demanda tampoco se reparte pareja entre los artículos: ocho
     -- productos de alta rotación se llevan cerca del cuarenta por ciento
-    -- de los pedidos y el resto se distribuye sobre los demás.
-    CASE WHEN s.g % 10 < 3 THEN 1 + (s.g * 7 % 8)
-         ELSE 1 + (s.g * 17 % 54) END,
-    -- Cantidad y canal salen de divisores coprimos entre sí, 3 y 7, y
-    -- coprimos también con los que asignan cliente, producto y fecha. Si
-    -- compartieran divisor, cada canal quedaría atado a una cantidad fija
-    -- y la facturación por canal mediría el divisor en lugar del negocio.
+    -- de los pedidos y el resto se distribuye sobre los demás. Los cinco
+    -- últimos del catálogo quedan fuera del rango y por eso no registran
+    -- ninguna venta.
+    CASE WHEN s.g % 13 < 5 THEN 1 + (s.g * 3 % 8)
+         ELSE 9 + (s.g * 17 % 47) END,
+    -- La cantidad sale del módulo 3, y ninguno de los divisores que
+    -- asignan cliente, producto, canal o los huecos de la limpieza es
+    -- múltiplo de 3. Si alguno lo fuera, ese atributo quedaría atado a
+    -- una cantidad fija y cualquier lectura de unidades o de ticket
+    -- promedio mediría el divisor en lugar del negocio.
     1 + (s.g % 3),
     NULL,          -- se completa en 3.4, que necesita el precio del producto
     DATE '2024-01-01' + s.dia,
     -- La mezcla de canales es despareja: el marketplace concentra tres de
-    -- cada siete pedidos y la web uno de cada siete.
+    -- cada siete pedidos y la web uno de cada siete. El reparto está
+    -- fijado acá, así que la diferencia de volumen entre canales es parte
+    -- del escenario y no un hallazgo de los datos.
     (ARRAY['Marketplace','Marketplace','Marketplace',
            'App','App','Teléfono','Web'])[1 + (s.g % 7)]
 FROM (
     SELECT g, (g * 367 % 730) AS dia
     FROM generate_series(1, 5110) AS g
 ) AS s
-WHERE NOT (s.dia >= 365 AND s.g % 11 = 4);
+WHERE NOT (s.dia >= 366 AND s.g % 23 IN (4, 17));
 
 -- 3.4. Precios cobrados
 -- El precio unitario es el de lista menos un descuento de hasta el nueve
--- y medio por ciento, en pasos de una décima. El divisor 97 es primo y
+-- coma seis por ciento, en pasos de una décima. El divisor 97 es primo y
 -- por lo tanto coprimo con todos los demás del generador, y da noventa y
--- siete descuentos distintos: con pocos escalones, cientos de pedidos
--- terminarían con el importe exactamente igual y cualquier ranking de
--- pedidos devolvería empates masivos en lugar de un orden.
+-- seis descuentos distintos más el caso sin descuento: con pocos
+-- escalones, cientos de pedidos terminarían con el importe exactamente
+-- igual y cualquier ranking de pedidos devolvería empates masivos en
+-- lugar de un orden.
 --
--- Que el precio cobrado y el de lista vivan en la misma escala es lo que
--- hace que más adelante completar un precio faltante con el de lista sea
--- una estimación razonable: si el cobrado fuera varias veces el de lista,
--- ese COALESCE subestimaría la facturación.
+-- Que el precio cobrado y el de lista estén en el mismo orden de
+-- magnitud es lo que hace que más adelante completar un precio faltante
+-- con el de lista sea una estimación razonable. La contracara es que el
+-- de lista no lleva descuento, así que esa estimación queda unos puntos
+-- por encima del valor que habría tenido el pedido.
 UPDATE pedidos p
 SET precio_unitario = round(pr.precio_lista * (1 - (p.pedido_id % 97) / 1000.0), 2)
 FROM productos pr
@@ -210,35 +246,42 @@ WHERE pr.producto_id = p.producto_id
   AND pr.precio_lista IS NOT NULL;
 
 -- 3.5. Los huecos que resuelve la limpieza
--- Pedidos que perdieron el precio en la importación. Como el producto sí
--- tiene precio de lista, son recuperables.
-UPDATE pedidos SET precio_unitario = NULL WHERE pedido_id % 12 = 5;
+-- Pedidos que perdieron el precio en la importación. El divisor 11 es
+-- primo, de modo que el hueco no cae sobre una cantidad ni sobre un canal
+-- en particular. La mayoría son recuperables, porque su producto sí tiene
+-- precio de lista; los que caen sobre un artículo sin precio cargado se
+-- suman al grupo irrecuperable, y la etapa de limpieza los separa.
+UPDATE pedidos SET precio_unitario = NULL WHERE pedido_id % 11 = 5;
 
 -- Pedidos sin fecha. Estos no se recuperan por ningún camino: nada en el
--- resto de la fila permite estimar cuándo ocurrió la venta.
-UPDATE pedidos SET fecha_pedido = NULL WHERE pedido_id % 33 = 0;
+-- resto de la fila permite estimar cuándo ocurrió la venta. El divisor
+-- 31 también es primo y por el mismo motivo.
+UPDATE pedidos SET fecha_pedido = NULL WHERE pedido_id % 31 = 0;
 
--- A esos se suman, por arrastre, los pedidos de los seis productos sin
--- precio de lista. Son el caso más difícil, porque tampoco se pueden
--- deducir del costo: el margen varía por artículo y no se conoce.
+-- A esos se suman, por arrastre, los pedidos de los artículos sin precio
+-- de lista. Ahí el costo no ofrece un atajo, porque cada artículo tiene
+-- su propio margen y ninguna columna lo registra.
+
+COMMIT;
 
 
 -- ---------------------------------------------------------------------
 -- 4. ÍNDICES
 -- ---------------------------------------------------------------------
--- Solo tres. Indexar de más cuesta en cada escritura, y sobre las casi
--- cinco mil filas de este dataset el planificador resuelve la mayoría de
--- las consultas con recorrido secuencial igual; están pensados para el
--- volumen al que crece la tabla.
+-- Solo tres. Indexar de más cuesta en cada escritura, y están pensados
+-- para el volumen al que crece la tabla y no para el tamaño actual del
+-- dataset. La sección de cierre de analisis.sql muestra con EXPLAIN qué
+-- hace el planificador con ellos hoy.
 
 -- Las dos claves foráneas, que es por donde pedidos se une con el resto.
 -- PostgreSQL indexa la clave primaria pero no las foráneas.
 CREATE INDEX idx_pedidos_cliente  ON pedidos (cliente_id);
 CREATE INDEX idx_pedidos_producto ON pedidos (producto_id);
 
--- La fecha, que es por donde filtra y agrupa la serie temporal. B-Tree
--- porque mantiene un orden total sobre el valor, y ese orden es lo que
--- permite resolver un rango recorriendo solo el tramo que corresponde.
+-- La fecha, que es por donde el análisis de la serie temporal filtra y
+-- agrupa. B-Tree porque mantiene un orden total sobre el valor, y ese
+-- orden es lo que permite resolver un rango recorriendo solo el tramo
+-- que corresponde.
 CREATE INDEX idx_pedidos_fecha ON pedidos (fecha_pedido);
 
 -- Canal y categoría quedan sin indexar: con cuatro y cinco valores
@@ -252,8 +295,9 @@ ANALYZE pedidos;
 -- ---------------------------------------------------------------------
 -- 5. VERIFICACIÓN DE LA CARGA
 -- ---------------------------------------------------------------------
--- Confirma de entrada que los datos entraron completos y que los tipos
--- quedaron declarados como corresponde.
+-- Confirma de entrada que los datos entraron completos, que los tipos
+-- quedaron declarados como corresponde y que no hay inconsistencias
+-- entre tablas.
 
 SELECT 'clientes'  AS tabla, count(*) AS filas FROM clientes
 UNION ALL
@@ -263,20 +307,50 @@ SELECT 'pedidos',   count(*) FROM pedidos
 ORDER BY tabla;
 
 -- Cobertura temporal de la carga: cuántos días distintos tienen al menos
--- un pedido y entre qué fechas. Si quedaran días vacíos, cualquier
--- lectura por semana o por día de la semana saldría distorsionada.
+-- un pedido y entre qué fechas. Si quedaran días vacíos, habría meses
+-- con menos días de actividad que otros y la variación mes a mes
+-- mediría el calendario además del negocio.
 SELECT count(DISTINCT fecha_pedido) AS dias_con_pedidos,
        min(fecha_pedido)            AS primer_pedido,
        max(fecha_pedido)            AS ultimo_pedido
 FROM pedidos;
 
+-- Tres controles de integridad que sí pueden fallar, con el resultado
+-- escrito al lado para que no haya que deducirlo de la salida.
+SELECT 'ningún pedido anterior al alta de su cliente' AS control,
+       count(*) AS casos,
+       CASE WHEN count(*) = 0 THEN 'OK' ELSE 'ALERTA' END AS resultado
+FROM pedidos p
+JOIN clientes c ON c.cliente_id = p.cliente_id
+WHERE p.fecha_pedido < c.fecha_alta
+UNION ALL
+-- Va mayor o igual y no mayor estricto: un artículo que se vende
+-- exactamente a su costo tampoco es una venta, así que conviene que
+-- dispare la alerta igual que uno que se vende por debajo.
+SELECT 'ningún artículo con costo mayor o igual al precio de lista',
+       count(*),
+       CASE WHEN count(*) = 0 THEN 'OK' ELSE 'ALERTA' END
+FROM productos
+WHERE precio_lista IS NOT NULL AND costo >= precio_lista
+UNION ALL
+SELECT 'ninguna columna de dinero en punto flotante',
+       count(*),
+       CASE WHEN count(*) = 0 THEN 'OK' ELSE 'ALERTA' END
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name IN ('productos','pedidos')
+  AND column_name IN ('precio_lista','costo','precio_unitario')
+  AND data_type <> 'numeric';
+
+-- Tipos declarados de las tres tablas, completos. Se listan todas las
+-- columnas y no solo las de fecha y dinero, porque parte de lo que hay
+-- que verificar es que el texto haya quedado en TEXT.
 SELECT table_name  AS tabla,
        column_name AS columna,
        data_type   AS tipo,
-       numeric_precision AS precision,
+       numeric_precision AS digitos,
        numeric_scale     AS escala
 FROM information_schema.columns
 WHERE table_schema = 'public'
   AND table_name IN ('clientes','productos','pedidos')
-  AND (data_type IN ('date','numeric') OR column_name LIKE '%fecha%')
 ORDER BY table_name, ordinal_position;
