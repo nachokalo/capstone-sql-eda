@@ -141,21 +141,14 @@ FROM generate_series(1, 200) AS g;
 -- artículo cuesta más de lo que se vende.
 --
 -- Dos recaudos para que los artículos sin precio cargado se parezcan a
--- un dato faltante de verdad. El precio base es cuadrático sobre el
--- número de artículo y da varias vueltas sobre el módulo 9800, de modo
--- que no crece de forma ordenada: interpolar entre los dos vecinos del
--- catálogo falla en cuatro de los seis casos, con errores de entre el
--- cincuenta por ciento y más de dos mil, y acierta en los otros dos por
--- casualidad, con menos del dos por ciento de error. El segundo recaudo
--- es el margen, que toma un valor propio en cada artículo, así que el
--- artículo de al lado tampoco lo delata.
---
--- Ninguno de los dos vuelve el hueco irreconstruible, y conviene decirlo
--- acá en lugar de dejarlo para que lo descubra el lector: sobre un
--- dataset determinista, quien despeje las fórmulas del generador
--- reconstruye cualquier valor. Lo que se busca es que no se despeje
--- desde las tablas, que es la información con la que trabaja el
--- análisis.
+-- un dato faltante de verdad, o sea para que no se puedan despejar
+-- mirando las tablas. El precio base es cuadrático sobre el número de
+-- artículo y da varias vueltas sobre el módulo 9800, de modo que no
+-- crece de forma ordenada: interpolar entre los dos vecinos del catálogo
+-- falla en cuatro de los seis casos, con errores de entre el cincuenta
+-- por ciento y más de dos mil, y acierta en los otros dos por
+-- casualidad. El segundo recaudo es el margen, que toma un valor propio
+-- en cada artículo, así que el de al lado tampoco lo delata.
 INSERT INTO productos (producto_id, nombre, categoria, precio_lista, costo, stock, activo)
 SELECT
     g,
