@@ -493,12 +493,15 @@ SELECT c.cliente_id,
        -- recorte. Da el peso real de cada uno sobre el total.
        round(100.0 * sum(v.importe) / NULLIF(SUM(sum(v.importe)) OVER (), 0), 2)
                                  AS pct_del_total,
-       -- El frame va explícito. Con el RANGE por defecto, dos clientes
-       -- que facturaran lo mismo compartirían el valor del acumulado en
-       -- lugar de avanzar de a uno. Acá no hay empates, así que las dos
-       -- formas dan igual; se escribe para que el resultado no dependa
-       -- de esa casualidad.
-       round(100.0 * SUM(sum(v.importe)) OVER (ORDER BY sum(v.importe) DESC
+       -- El frame va explícito y el orden de la ventana lleva el mismo
+       -- desempate que el ORDER BY de salida. Las dos cosas van juntas:
+       -- con ROWS el acumulado avanza fila por fila, así que si la
+       -- ventana ordenara distinto que la salida, dos clientes de igual
+       -- gasto podrían recibir acumulados que no siguen el orden en que
+       -- se imprimen. Acá no hay empates de gasto, pero el resultado no
+       -- debería depender de eso.
+       round(100.0 * SUM(sum(v.importe)) OVER (ORDER BY sum(v.importe) DESC,
+                                                        c.cliente_id
                                                ROWS BETWEEN UNBOUNDED PRECEDING
                                                         AND CURRENT ROW)
              / NULLIF(SUM(sum(v.importe)) OVER (), 0), 2) AS pct_acumulado
@@ -1177,13 +1180,44 @@ LIMIT 3;
 -- Lo mismo para la primera pregunta adicional: con INNER JOIN los diez
 -- clientes que nunca compraron no aparecen, y el padrón que se segmenta
 -- pasa de 200 a 190.
-SELECT count(*) AS clientes_con_left_join
-FROM clientes c
-WHERE TRUE
+SELECT 1 AS orden, 'con LEFT JOIN, el padrón completo' AS cruce,
+       count(*) AS clientes
+FROM clientes
 UNION ALL
-SELECT count(DISTINCT c.cliente_id)
+SELECT 2, 'con INNER JOIN, solo los que compraron',
+       count(DISTINCT c.cliente_id)
 FROM clientes c
-JOIN ventas_limpias v ON v.cliente_id = c.cliente_id;
+JOIN ventas_limpias v ON v.cliente_id = c.cliente_id
+ORDER BY orden;
+
+-- El error de estimar el precio faltante interpolando entre los dos
+-- vecinos del catálogo, que es la alternativa que el comentario de
+-- estructura.sql descarta. Se mide contra la estimación desde el costo,
+-- que es la que el análisis usa.
+WITH vecinos AS (
+    SELECT pr.producto_id,
+           (SELECT precio_lista FROM productos a
+            WHERE a.producto_id < pr.producto_id AND a.precio_lista IS NOT NULL
+            ORDER BY a.producto_id DESC LIMIT 1) AS anterior,
+           (SELECT precio_lista FROM productos d
+            WHERE d.producto_id > pr.producto_id AND d.precio_lista IS NOT NULL
+            ORDER BY d.producto_id LIMIT 1) AS siguiente
+    FROM productos pr
+    WHERE pr.precio_lista IS NULL
+),
+margen AS (
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY costo / precio_lista) AS mediana
+    FROM productos WHERE precio_lista IS NOT NULL
+)
+SELECT v.producto_id,
+       round((v.anterior + v.siguiente) / 2, 2)              AS precio_interpolado,
+       round((pr.costo / m.mediana)::numeric, 2)             AS precio_desde_el_costo,
+       round((100.0 * ((v.anterior + v.siguiente) / 2 - pr.costo / m.mediana)
+             / NULLIF(pr.costo / m.mediana, 0))::numeric, 1) AS desvio_de_la_interpolacion_pct
+FROM vecinos v
+JOIN productos pr ON pr.producto_id = v.producto_id
+CROSS JOIN margen m
+ORDER BY v.producto_id;
 
 -- Y la concentración que los comentarios del generador afirman, medida:
 -- cuánto pesan los veinticinco primeros clientes y los ocho artículos de

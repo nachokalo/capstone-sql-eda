@@ -144,11 +144,11 @@ FROM generate_series(1, 200) AS g;
 -- un dato faltante, o sea para que no se despejen leyendo las tres
 -- tablas. El precio base es cuadrático sobre el número de artículo y da
 -- varias vueltas sobre el módulo 9800, de modo que no crece de forma
--- ordenada: interpolar entre los dos vecinos del catálogo se equivoca
--- entre el cuarenta y nueve y más de dos mil por ciento en cuatro de los
--- seis casos, y en los otros dos queda a menos de dos puntos por
--- casualidad. El segundo recaudo es el margen, que toma un valor propio
--- en cada artículo, así que el de al lado tampoco lo delata.
+-- ordenada, de manera que interpolar entre los dos vecinos del catálogo
+-- da un número muy distinto del que sale del costo. El anexo de
+-- analisis.sql compara los dos caminos artículo por artículo. El segundo
+-- recaudo es el margen, que toma un valor propio en cada artículo, así
+-- que el de al lado tampoco lo delata.
 --
 -- Los dos recaudos valen frente a las tablas y no frente a este archivo:
 -- quien lea estas dos líneas tiene la fórmula y recupera cualquier
@@ -230,10 +230,12 @@ WHERE NOT (s.dia >= 366 AND s.g % 23 IN (4, 17));
 -- coma seis por ciento, en pasos de una décima. El divisor 97 es primo y
 -- por lo tanto coprimo con todos los demás del generador, y da noventa y
 -- seis descuentos distintos más el caso sin descuento. Con pocos
--- escalones habría muchos más pedidos con el importe exactamente igual;
--- empates quedan igual, porque dos pedidos del mismo producto, la misma
--- cantidad y el mismo escalón coinciden, pero son grupos chicos y no
--- bloques que se lleven puestos enteros del ranking.
+-- escalones habría muchos más pedidos con el importe exactamente igual.
+-- Empates quedan igual, porque dos pedidos del mismo producto, la misma
+-- cantidad y el mismo escalón coinciden: alrededor de un tercio de las
+-- filas del ranking comparte importe con alguna otra, en grupos de hasta
+-- diez. Lo que el descuento fino evita son los bloques que se llevarían
+-- puestos enteros.
 --
 -- Que el precio cobrado y el de lista estén en el mismo orden de
 -- magnitud es lo que hace que más adelante completar un precio faltante
@@ -329,7 +331,8 @@ FROM pedidos;
 -- fallara, el script corta con error en lugar de imprimir ALERTA y
 -- seguir. La diferencia importa, porque un control que solo escribe una
 -- palabra depende de que alguien la lea.
-SELECT 'ningún pedido anterior al alta de su cliente' AS control,
+SELECT 1 AS orden,
+       'ningún pedido anterior al alta de su cliente' AS control,
        count(*) AS casos,
        CASE WHEN count(*) = 0 THEN 'OK' ELSE 'ALERTA' END AS resultado
 FROM pedidos p
@@ -339,20 +342,24 @@ UNION ALL
 -- Va mayor o igual y no mayor estricto: un artículo que se vende
 -- exactamente a su costo tampoco es una venta, así que conviene que
 -- dispare la alerta igual que uno que se vende por debajo.
-SELECT 'ningún artículo con costo mayor o igual al precio de lista',
+SELECT 2,
+       'ningún artículo con costo mayor o igual al precio de lista',
        count(*),
        CASE WHEN count(*) = 0 THEN 'OK' ELSE 'ALERTA' END
 FROM productos
 WHERE precio_lista IS NOT NULL AND costo >= precio_lista
 UNION ALL
-SELECT 'ninguna columna de dinero en punto flotante',
+SELECT 3,
+       'ninguna columna de dinero en punto flotante',
        count(*),
        CASE WHEN count(*) = 0 THEN 'OK' ELSE 'ALERTA' END
 FROM information_schema.columns
 WHERE table_schema = 'public'
   AND table_name IN ('productos','pedidos')
   AND column_name IN ('precio_lista','costo','precio_unitario')
-  AND data_type <> 'numeric';
+  AND data_type <> 'numeric'
+-- El orden de un UNION ALL no está garantizado, así que se declara.
+ORDER BY orden;
 
 DO $$
 DECLARE
