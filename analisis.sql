@@ -765,6 +765,12 @@ ORDER BY categoria, puesto, pedido_id;
 -- empatados adentro, en lugar de cortar un empate por la mitad. Acá el
 -- primer puesto está compartido en las cinco categorías, de modo que
 -- cada una devuelve tres filas con los puestos 1, 1 y 3, sin puesto 2.
+-- La contracara del criterio es que con empates masivos el corte deja de
+-- acotar el tamaño de la salida: si todos los pedidos de una categoría
+-- tuvieran el mismo importe, todos quedarían en el puesto 1 y el corte
+-- los devolvería a todos. Se acepta igual, porque un corte por cantidad
+-- de filas elegiría arbitrariamente entre pedidos del mismo puesto, que
+-- es peor para decidir que una salida larga.
 --
 -- Se proyecta también el origen del precio, porque es la columna que
 -- explica el empate.
@@ -951,7 +957,12 @@ WITH gasto_por_cliente AS (
            -- importe conocido, igual que en el punto 1 y en la
            -- pregunta adicional 2.
            count(v.importe)             AS pedidos_con_importe,
-           COALESCE(sum(v.importe), 0)  AS gasto
+           COALESCE(sum(v.importe), 0)  AS gasto,
+           -- Las unidades de los pedidos que entran en el importe medio,
+           -- para poder separar después si un ticket más bajo es por
+           -- comprar menos unidades o por comprar artículos más baratos.
+           COALESCE(sum(v.cantidad) FILTER (WHERE v.importe IS NOT NULL), 0)
+                                        AS unidades_con_importe
     FROM clientes c
     LEFT JOIN ventas_limpias v ON v.cliente_id = c.cliente_id
     GROUP BY c.cliente_id
@@ -960,6 +971,7 @@ clasificados AS (
     SELECT cliente_id,
            pedidos,
            pedidos_con_importe,
+           unidades_con_importe,
            gasto,
            CASE WHEN pedidos = 0 THEN 0
                 ELSE NTILE(4) OVER (PARTITION BY (pedidos = 0)
@@ -979,6 +991,15 @@ SELECT CASE cuartil WHEN 0 THEN 'Sin actividad'
        sum(gasto)               AS facturacion,
        round(100.0 * sum(gasto) / NULLIF(SUM(sum(gasto)) OVER (), 0), 1) AS pct_facturacion,
        round(sum(gasto) / NULLIF(sum(pedidos_con_importe), 0), 2) AS importe_medio_por_pedido,
+       -- Con la cantidad media al lado, el importe medio se puede leer.
+       -- Si la cantidad es la misma en los cuatro grupos, la diferencia
+       -- de ticket es precio y no volumen por pedido.
+       round(sum(unidades_con_importe)::numeric
+             / NULLIF(sum(pedidos_con_importe), 0), 3) AS cantidad_media_por_pedido,
+       -- Y los pedidos por cliente, que son la otra lectura posible de la
+       -- concentración: si el cuartil 1 concentra por frecuencia, acá se ve.
+       min(pedidos)                            AS pedidos_minimo_del_grupo,
+       max(pedidos)                            AS pedidos_maximo_del_grupo,
        -- Los extremos de cada grupo dicen si el corte del NTILE cae en
        -- un quiebre real de la distribución o en el medio de una
        -- pendiente suave. De eso depende que el grupo se pueda
@@ -1014,14 +1035,20 @@ quiebre AS (
     SELECT puesto, gasto, gasto_siguiente
     FROM ordenados
     WHERE gasto_siguiente IS NOT NULL
+      -- El salto tiene que ser estrictamente positivo. Con gastos todos
+      -- iguales el mayor salto es cero, y devolverlo informaría un
+      -- quiebre en el primer puesto donde en realidad la cartera está
+      -- perfectamente repartida.
+      AND gasto - gasto_siguiente > 0
     ORDER BY gasto - gasto_siguiente DESC, puesto
     LIMIT 1
 )
 -- La consulta arranca en quiebre y no en ordenados: si no hubiera
--- quiebre, por ejemplo con un solo cliente, no devuelve nada en lugar de
--- devolver una fila de ceros, que se leería como que la cartera no está
--- concentrada. Un agregado sin GROUP BY siempre devuelve una fila, así
--- que filtrar con un WHERE no alcanzaría.
+-- quiebre, sea porque hay un solo cliente o porque todos gastan lo
+-- mismo, no devuelve nada en lugar de devolver una fila de ceros, que se
+-- leería como que la cartera no está concentrada. Un agregado sin GROUP
+-- BY siempre devuelve una fila, así que filtrar con un WHERE no
+-- alcanzaría.
 SELECT q.puesto                              AS clientes_arriba_del_quiebre,
        q.gasto                               AS ultimo_gasto_antes_del_quiebre,
        q.gasto_siguiente                     AS primer_gasto_despues,
@@ -1161,9 +1188,8 @@ SELECT DATE_TRUNC('month', fecha_pedido), sum(importe) FROM ventas_limpias
 GROUP BY 1;
 
 -- ANEXO. Las comparaciones que el informe menciona, ejecutadas.
--- Cada una de estas tres cosas estaba afirmada en el texto y hasta acá
--- había que creerla; van con su salida al lado para que no haya que
--- hacerlo.
+-- Cada una de estas cosas estaba afirmada en el texto y hasta acá había
+-- que creerla; van con su salida al lado para que no haya que hacerlo.
 --
 -- Primero, el contrafáctico del punto 3: qué devolvería la consulta de
 -- los tres productos menos vendidos con INNER JOIN en lugar de LEFT
@@ -1230,6 +1256,104 @@ SELECT count(*)                                              AS pedidos_totales,
        round(100.0 * count(*) FILTER (WHERE producto_id <= 8)
              / NULLIF(count(*), 0), 1)                       AS pct_productos
 FROM pedidos;
+
+-- Por qué Electrónica factura menos que las otras cuatro. El informe lo
+-- atribuye al nivel de precio y no al volumen, y la forma de decidirlo es
+-- poner las tres columnas juntas: contra Librería los pedidos y las
+-- unidades son casi iguales y la facturación no, así que lo que separa a
+-- las dos categorías es el precio por unidad.
+SELECT v.categoria,
+       count(*)                                        AS pedidos_con_importe,
+       sum(v.cantidad)                                 AS unidades,
+       round(sum(v.importe), 2)                        AS facturacion,
+       round(sum(v.importe) / NULLIF(sum(v.cantidad), 0), 2)
+                                                       AS precio_implicito,
+       -- Cuánto le saca cada categoría a la más chica, en por ciento, para
+       -- no tener que estimar la brecha a ojo desde la columna anterior.
+       round(100.0 * sum(v.importe)
+             / NULLIF(min(sum(v.importe)) OVER (), 0) - 100, 1)
+                                                       AS pct_sobre_la_mas_chica
+FROM ventas_limpias v
+WHERE v.importe IS NOT NULL
+GROUP BY v.categoria
+ORDER BY facturacion ASC, v.categoria ASC;
+
+-- La descomposición de la participación del primer puesto de cada
+-- categoría en sus dos patas, que es lo que el informe usa para explicar
+-- por qué concentra el rubro que concentra. La participación es
+-- la cuota de unidades por el precio relativo al precio implícito del
+-- rubro, así que poniendo las tres columnas juntas se ve cuál de las dos
+-- pesa en cada caso. El nivel absoluto de precio de la categoría no entra
+-- acá, y no puede entrar: numerador y denominador son del mismo rubro.
+WITH por_producto AS (
+    SELECT v.categoria,
+           v.producto_id,
+           pr.nombre,
+           sum(v.cantidad) AS unidades,
+           sum(v.importe)  AS facturacion
+    FROM ventas_limpias v
+    JOIN productos pr ON pr.producto_id = v.producto_id
+    WHERE v.importe IS NOT NULL
+    GROUP BY v.categoria, v.producto_id, pr.nombre
+),
+por_categoria AS (
+    SELECT categoria,
+           sum(unidades)    AS unidades_cat,
+           sum(facturacion) AS facturacion_cat
+    FROM por_producto
+    GROUP BY categoria
+),
+ordenado AS (
+    SELECT pp.*, pc.unidades_cat, pc.facturacion_cat,
+           ROW_NUMBER() OVER (PARTITION BY pp.categoria
+                              ORDER BY pp.facturacion DESC, pp.producto_id) AS puesto
+    FROM por_producto pp
+    JOIN por_categoria pc ON pc.categoria = pp.categoria
+)
+SELECT categoria,
+       puesto,
+       nombre,
+       unidades,
+       round(100.0 * unidades / NULLIF(unidades_cat, 0), 1)  AS cuota_de_unidades,
+       round((facturacion / NULLIF(unidades, 0))
+             / NULLIF(facturacion_cat / NULLIF(unidades_cat, 0), 0), 3)
+                                                             AS precio_relativo_al_rubro,
+       round(100.0 * facturacion / NULLIF(facturacion_cat, 0), 1)
+                                                             AS participacion
+-- Hasta el cuarto puesto por el mismo motivo que la extensión C del punto
+-- 4: el caso de Librería, donde el artículo de mucha rotación queda
+-- cuarto, es justo el que muestra que las dos patas no van siempre juntas.
+FROM ordenado
+WHERE puesto <= 4
+ORDER BY categoria, puesto;
+
+-- Y por qué el gradiente de ticket entre cuartiles no dice que los
+-- clientes de abajo compren más barato. El generador reparte pedidos en
+-- dos niveles de frecuencia bien separados; si el ticket dependiera de la
+-- frecuencia, los dos niveles tendrían tickets distintos. El corte va en
+-- sesenta pedidos porque no hay ningún cliente entre 17 y 83, de manera
+-- que cualquier valor intermedio parte la cartera en los mismos dos
+-- grupos.
+WITH gasto_por_cliente AS (
+    SELECT v.cliente_id,
+           count(*)     AS pedidos_con_importe,
+           sum(v.importe) AS gasto
+    FROM ventas_limpias v
+    WHERE v.importe IS NOT NULL
+    GROUP BY v.cliente_id
+)
+SELECT CASE WHEN pedidos_con_importe >= 60 THEN 'alta frecuencia'
+            ELSE 'baja frecuencia' END                 AS nivel,
+       count(*)                                        AS clientes,
+       -- El rótulo dice con importe a propósito: son los pedidos que
+       -- entran en el ticket, no todos los que recibió el cliente.
+       min(pedidos_con_importe)                        AS pedidos_con_importe_minimo,
+       max(pedidos_con_importe)                        AS pedidos_con_importe_maximo,
+       round(sum(gasto) / NULLIF(sum(pedidos_con_importe), 0), 2)
+                                                       AS ticket_medio
+FROM gasto_por_cliente
+GROUP BY 1
+ORDER BY 1;
 
 -- Y los dos planes que justifican los índices de las claves foráneas,
 -- que no se usan en los cruces sino en las consultas de existencia del
